@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>OASIS Core — предпросмотр</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <canvas id="scene"></canvas>
+
+    <div id="crosshair" class="crosshair" hidden></div>
+
+    <div id="status" class="status">
+      <span id="status-dot" class="dot dot-warn"></span>
+      <span id="status-text">подключение…</span>
+    </div>
+
+    <div id="stats" class="stats" hidden>
+      <span id="stat-fps">— fps</span>
+      <span id="stat-ping">— ms</span>
+      <span id="stat-players">— игроков</span>
+      <span id="stat-backend">—</span>
+      <span id="stat-balance">— ¤</span>
+    </div>
+
+    <div id="chat" class="chat">
+      <div id="chat-log" class="chat-log"></div>
+      <form id="chat-form" class="chat-form" hidden>
+        <input
+          id="chat-input"
+          class="chat-input"
+          type="text"
+          maxlength="240"
+          autocomplete="off"
+          placeholder="сообщение… (Enter — отправить, Esc — отмена)"
+        />
+      </form>
+    </div>
+
+    <div id="hint" class="hint">
+      <b>WASD</b> — движение · <b>Shift</b> — бег · <b>мышь</b> — обзор (клик по сцене) ·
+      <b>Enter</b> — чат · <b>Tab</b> — освободить курсор
+    </div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

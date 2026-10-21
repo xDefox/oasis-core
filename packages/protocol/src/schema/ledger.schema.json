@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oasis.dev/schema/ledger.schema.json",
+  "title": "OASIS Ledger Entry",
+  "description": "Одна проводка в append-only журнале экономики. Баланс счёта = сумма проводок. Источник истины по деньгам.",
+  "type": "object",
+  "required": ["id", "ts", "worldId", "accountId", "kind", "amount", "reason"],
+  "additionalProperties": false,
+  "properties": {
+    "id": { "type": "string", "minLength": 1 },
+    "ts": { "type": "integer", "minimum": 0, "description": "Unix ms" },
+    "worldId": { "type": "string", "minLength": 1 },
+    "accountId": { "type": "string", "minLength": 1 },
+    "kind": {
+      "enum": ["genesis", "faucet", "sink", "source", "transfer", "fee", "adjustment"],
+      "description": "source — эмиссия (кран), sink — сжигание (сток), transfer — перевод между игроками, fee — комиссия платформы"
+    },
+    "amount": {
+      "type": "number",
+      "description": "Знаковая величина. Положительная — начисление, отрицательная — списание."
+    },
+    "reason": { "type": "string" },
+    "counterpartyId": { "type": ["string", "null"] },
+    "meta": { "type": "object" }
+  }
+}

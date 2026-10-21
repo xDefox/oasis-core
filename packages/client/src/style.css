@@ -1,0 +1,194 @@
+:root {
+  --bg: #0b0e14;
+  --panel: rgba(14, 18, 28, 0.82);
+  --panel-border: rgba(120, 160, 220, 0.18);
+  --text: #d7e0f0;
+  --muted: #8494ad;
+  --accent: #4fa3ff;
+  --ok: #6fcf7f;
+  --warn: #ffd166;
+  --err: #ff7a59;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'Inter', 'Segoe UI', system-ui, -apple-system, sans-serif;
+  font-size: 14px;
+}
+
+#scene {
+  display: block;
+  width: 100vw;
+  height: 100vh;
+  cursor: crosshair;
+}
+
+/* ── прицел ─────────────────────────────────────────────── */
+.crosshair {
+  position: fixed;
+  left: 50%;
+  top: 50%;
+  width: 18px;
+  height: 18px;
+  margin: -9px 0 0 -9px;
+  pointer-events: none;
+  opacity: 0.65;
+}
+
+.crosshair::before,
+.crosshair::after {
+  content: '';
+  position: absolute;
+  background: #fff;
+  box-shadow: 0 0 3px rgba(0, 0, 0, 0.8);
+}
+
+.crosshair::before {
+  left: 8px;
+  top: 0;
+  width: 2px;
+  height: 18px;
+}
+
+.crosshair::after {
+  top: 8px;
+  left: 0;
+  height: 2px;
+  width: 18px;
+}
+
+/* ── статус подключения ────────────────────────────────── */
+.status {
+  position: fixed;
+  top: 12px;
+  left: 12px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 12px;
+  background: var(--panel);
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  backdrop-filter: blur(6px);
+  font-variant-numeric: tabular-nums;
+}
+
+.dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--muted);
+  box-shadow: 0 0 8px currentColor;
+}
+
+.dot-ok {
+  background: var(--ok);
+}
+.dot-warn {
+  background: var(--warn);
+}
+.dot-err {
+  background: var(--err);
+}
+
+/* ── статистика ─────────────────────────────────────────── */
+.stats {
+  position: fixed;
+  top: 12px;
+  right: 12px;
+  display: flex;
+  gap: 14px;
+  padding: 7px 12px;
+  background: var(--panel);
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  backdrop-filter: blur(6px);
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── чат ────────────────────────────────────────────────── */
+.chat {
+  position: fixed;
+  left: 12px;
+  bottom: 12px;
+  width: min(460px, calc(100vw - 24px));
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.chat-log {
+  max-height: 32vh;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 10px;
+  background: var(--panel);
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  backdrop-filter: blur(6px);
+}
+
+.chat-line {
+  color: var(--text);
+  word-break: break-word;
+}
+
+.chat-line .who {
+  font-weight: 600;
+  margin-right: 6px;
+}
+
+.chat-line.system {
+  color: var(--muted);
+  font-style: italic;
+}
+
+.chat-form {
+  display: flex;
+}
+
+.chat-input {
+  width: 100%;
+  padding: 9px 12px;
+  background: var(--panel);
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  color: var(--text);
+  outline: none;
+  font: inherit;
+}
+
+.chat-input::placeholder {
+  color: var(--muted);
+}
+
+/* ── подсказка по управлению ────────────────────────────── */
+.hint {
+  position: fixed;
+  right: 12px;
+  bottom: 12px;
+  padding: 7px 12px;
+  background: var(--panel);
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  backdrop-filter: blur(6px);
+  color: var(--muted);
+  max-width: min(560px, calc(100vw - 24px));
+}
+
+.hint b {
+  color: var(--text);
+  font-weight: 600;
+}

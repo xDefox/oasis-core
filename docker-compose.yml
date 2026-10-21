@@ -1,0 +1,46 @@
+# Инфраструктура для режима STORAGE=postgres.
+#
+# По умолчанию проект запускается без Docker: STORAGE=memory.
+# Compose нужен, когда хочется проверить ledger на настоящем Postgres
+# и задел под Redis (пока используется только как конфиг).
+#
+#   docker compose up -d
+#   STORAGE=postgres DATABASE_URL=postgres://oasis:oasis@localhost:5432/oasis npm run dev
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: oasis-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: oasis
+      POSTGRES_PASSWORD: oasis
+      POSTGRES_DB: oasis
+    ports:
+      - '5432:5432'
+    volumes:
+      - oasis-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U oasis -d oasis']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: oasis-redis
+    restart: unless-stopped
+    command: ['redis-server', '--appendonly', 'yes']
+    ports:
+      - '6379:6379'
+    volumes:
+      - oasis-redisdata:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  oasis-pgdata:
+  oasis-redisdata:

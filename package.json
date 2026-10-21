@@ -1,0 +1,29 @@
+{
+  "name": "oasis-core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "OASIS Core — протокол и ядро федеративной платформы виртуальных миров",
+  "workspaces": [
+    "packages/protocol",
+    "packages/server",
+    "packages/client"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "dev:server": "npm run dev -w @oasis/server",
+    "dev:client": "npm run dev -w @oasis/client",
+    "build": "npm run build -w @oasis/client",
+    "start": "npm run start -w @oasis/server",
+    "typecheck": "npm run typecheck -w @oasis/protocol && npm run typecheck -w @oasis/server && npm run typecheck -w @oasis/client",
+    "test": "node --import tsx --test \"packages/*/test/**/*.test.ts\""
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.0"
+  }
+}

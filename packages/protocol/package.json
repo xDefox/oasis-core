@@ -1,0 +1,18 @@
+{
+  "name": "@oasis/protocol",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Wire-протокол и модель данных OASIS Core. Общий контракт клиента и сервера.",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./validation": "./src/validation.ts",
+    "./schema/world.schema.json": "./src/schema/world.schema.json",
+    "./schema/ledger.schema.json": "./src/schema/ledger.schema.json"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  }
+}

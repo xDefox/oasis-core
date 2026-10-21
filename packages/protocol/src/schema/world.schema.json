@@ -1,0 +1,112 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oasis.dev/schema/world.schema.json",
+  "title": "OASIS World",
+  "description": "Мир как данные. Версионируется, хранится в git или в S3, стримится клиенту по зонам.",
+  "type": "object",
+  "required": ["id", "version", "seed", "generator", "sectors", "zones", "portals"],
+  "additionalProperties": false,
+  "properties": {
+    "id": { "type": "string", "minLength": 1 },
+    "version": { "type": "integer", "minimum": 1 },
+    "seed": { "type": "integer" },
+    "generator": { "type": "string", "minLength": 1 },
+    "sectors": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["id", "name", "flags"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string" },
+          "name": { "type": "string" },
+          "flags": {
+            "type": "object",
+            "required": ["pvp", "magic", "tech", "teleport", "comms"],
+            "additionalProperties": false,
+            "properties": {
+              "pvp": { "type": "boolean" },
+              "magic": { "type": "boolean" },
+              "tech": { "type": "boolean" },
+              "teleport": { "type": "boolean" },
+              "comms": { "type": "boolean" }
+            }
+          },
+          "spawn": {
+            "type": "object",
+            "required": ["x", "y", "z"],
+            "additionalProperties": false,
+            "properties": {
+              "x": { "type": "number" },
+              "y": { "type": "number" },
+              "z": { "type": "number" }
+            }
+          }
+        }
+      }
+    },
+    "zones": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "sectorId", "name", "kind", "bounds", "groundColor", "props"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string" },
+          "sectorId": { "type": "string" },
+          "name": { "type": "string" },
+          "kind": { "enum": ["plaza", "grove", "arena", "hub", "test"] },
+          "bounds": {
+            "type": "object",
+            "required": ["x", "z", "w", "d"],
+            "additionalProperties": false,
+            "properties": {
+              "x": { "type": "number" },
+              "z": { "type": "number" },
+              "w": { "type": "number", "exclusiveMinimum": 0 },
+              "d": { "type": "number", "exclusiveMinimum": 0 }
+            }
+          },
+          "groundColor": { "type": "integer", "minimum": 0, "maximum": 16777215 },
+          "props": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["id", "type", "x", "y", "z", "sx", "sy", "sz", "rot", "color"],
+              "additionalProperties": false,
+              "properties": {
+                "id": { "type": "string" },
+                "type": { "enum": ["box", "cylinder", "sphere", "cone", "pillar"] },
+                "x": { "type": "number" },
+                "y": { "type": "number" },
+                "z": { "type": "number" },
+                "sx": { "type": "number", "minimum": 0 },
+                "sy": { "type": "number", "minimum": 0 },
+                "sz": { "type": "number", "minimum": 0 },
+                "rot": { "type": "number" },
+                "color": { "type": "integer", "minimum": 0, "maximum": 16777215 }
+              }
+            }
+          }
+        }
+      }
+    },
+    "portals": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "fromZone", "toZone", "x", "z", "radius"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string" },
+          "fromZone": { "type": "string" },
+          "toZone": { "type": "string" },
+          "x": { "type": "number" },
+          "z": { "type": "number" },
+          "radius": { "type": "number", "exclusiveMinimum": 0 }
+        }
+      }
+    }
+  }
+}
