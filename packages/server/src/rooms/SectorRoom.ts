@@ -81,6 +81,12 @@ interface Session {
   chatTimestamps: number[];
   balance: number;
   zoneId: string | null;
+  /** До какого момента порталы игнорируются (после телепорта). */
+  teleportUntil: number;
+  /** Когда пришёл последний ввод — по нему считаем TTL. */
+  lastInputAt: number;
+  lastZoneRequestAt: number;
+  lastChatErrorAt: number;
 }
 
 export interface SectorRoomOptions {
@@ -91,6 +97,14 @@ export interface SectorRoomOptions {
 
 /** Сколько ждём `hello` после подключения. */
 const HANDSHAKE_TIMEOUT_MS = 10_000;
+/** Пауза после телепорта: без неё игрок пинг-понгом летает между зонами. */
+const PORTAL_COOLDOWN_MS = 1_200;
+/** Ввод считается протухшим: клиент, переставший слать пакеты, должен замереть. */
+const INPUT_TTL_MS = 500;
+/** Не чаще одного запроса зоны в 250 мс (зона весит десятки килобайт JSON). */
+const ZONE_REQUEST_COOLDOWN_MS = 250;
+/** Радиус кольца спавна: игроки не появляются друг в друге. */
+const SPAWN_RADIUS = 1.2;
 
 const PLAYER_COLORS = [
   0x4fa3ff, 0xff7a59, 0x6fcf7f, 0xffd166, 0xc792ea, 0x59d4d4, 0xff8fa3, 0x9ad36f,
@@ -104,6 +118,11 @@ export class SectorRoom extends Room {
   private readonly sessions = new Map<string, Session>();
   /** Подключились, но ещё не прислали hello — сущности пока нет. */
   private readonly pending = new Map<string, HelloMsg>();
+  /**
+   * Выдача genesis в процессе. Две вкладки одного аккаунта одновременно —
+   * обычное дело, и без этой карты обе успевают увидеть «проводки нет».
+   */
+  private readonly genesisInFlight = new Map<string, Promise<number>>();
   private readonly entities = new Map<number, EntityState>();
   private nextEntityId = 1;
   private tick = 0;
@@ -112,6 +131,8 @@ export class SectorRoom extends Room {
     this.world = options.world;
     this.ledger = options.ledger;
     this.maxPlayers = options.maxPlayers ?? 64;
+    // Matchmaking должен отказывать сам, а не пускать и потом выкидывать.
+    this.maxClients = this.maxPlayers;
 
     this.setFixedTimestep((context) => this.simulate(context.dt), TICK_RATE);
     this.clock.setInterval(() => this.publish(), Math.round(1000 / SNAPSHOT_RATE));
@@ -128,6 +149,7 @@ export class SectorRoom extends Room {
         const input = decodeInput(bytes);
         session.input = input;
         session.yaw = input.yaw;
+        session.lastInputAt = Date.now();
       } catch (error) {
         logWarn('бинарный ввод не распознан', { error: String(error) });
       }
@@ -139,12 +161,24 @@ export class SectorRoom extends Room {
       if (!session) return;
       session.input = message;
       session.yaw = message.yaw;
+      session.lastInputAt = Date.now();
     });
 
     this.onMessage(C2S.Chat, chatSchema, (client, message) => {
       const session = this.sessions.get(client.sessionId);
       if (!session) return;
-      if (!this.allowChat(session)) return;
+      if (!this.allowChat(session)) {
+        // Раньше сообщение молча терялось. Теперь клиент знает, почему.
+        const now = Date.now();
+        if (now - session.lastChatErrorAt > 1_000) {
+          session.lastChatErrorAt = now;
+          client.send(S2C.Error, {
+            code: 'CHAT_TOO_FAST',
+            message: 'Слишком часто. Подождите немного.',
+          });
+        }
+        return;
+      }
 
       const text = message.text.trim().slice(0, 240);
       if (!text) return;
@@ -157,6 +191,12 @@ export class SectorRoom extends Room {
     });
 
     this.onMessage(C2S.ZoneRequest, zoneRequestSchema, (client, message) => {
+      const session = this.sessions.get(client.sessionId);
+      if (session) {
+        const now = Date.now();
+        if (now - session.lastZoneRequestAt < ZONE_REQUEST_COOLDOWN_MS) return;
+        session.lastZoneRequestAt = now;
+      }
       const zone = findZone(this.world, message.zoneId);
       if (!zone) {
         client.send(S2C.Error, {
@@ -185,7 +225,16 @@ export class SectorRoom extends Room {
         return;
       }
       this.pending.delete(client.sessionId);
-      void this.activateSession(client, hello);
+      // Без catch любая ошибка ledger (например, обрыв Postgres) станет
+      // unhandled rejection и уронит процесс, а не одного игрока.
+      void this.activateSession(client, hello).catch((error: unknown) => {
+        logWarn('не удалось активировать сессию', { error: String(error) });
+        client.send(S2C.Error, {
+          code: 'INTERNAL',
+          message: 'Не удалось войти в мир. Попробуйте ещё раз.',
+        });
+        client.leave(1011, 'internal error');
+      });
     });
   }
 
@@ -240,16 +289,17 @@ export class SectorRoom extends Room {
       return;
     }
 
-    const spawn = sector.spawn ?? { x: 0, y: 0, z: 0 };
+    const spawn = spawnPoint(sector.spawn ?? { x: 0, y: 0, z: 0 }, this.nextEntityId);
     const entityId = this.nextEntityId++;
     const color = PLAYER_COLORS[entityId % PLAYER_COLORS.length]!;
     const sessionId = client.sessionId;
+    const name = sanitizeName(hello.name);
 
     const session: Session = {
       client,
       sessionId,
       entityId,
-      name: hello.name,
+      name,
       accountId: hello.accountId,
       color,
       x: spawn.x,
@@ -263,6 +313,10 @@ export class SectorRoom extends Room {
       chatTimestamps: [],
       balance: 0,
       zoneId: null,
+      teleportUntil: 0,
+      lastInputAt: 0,
+      lastZoneRequestAt: 0,
+      lastChatErrorAt: 0,
     };
     this.sessions.set(sessionId, session);
 
@@ -312,7 +366,7 @@ export class SectorRoom extends Room {
     this.broadcastRoster();
     this.sendSnapshot(session);
 
-    logInfo(`игрок ${hello.name} вошёл в сектор ${sector.id}`, {
+    logInfo(`игрок ${name} вошёл в сектор ${sector.id}`, {
       players: this.sessions.size,
     });
   }
@@ -323,6 +377,7 @@ export class SectorRoom extends Room {
     if (!session) return;
     this.sessions.delete(client.sessionId);
     this.entities.delete(session.entityId);
+    this.genesisInFlight.delete(session.accountId);
     this.broadcastRoster();
     logInfo(`игрок ${session.name} вышел`, { players: this.sessions.size });
   }
@@ -336,28 +391,46 @@ export class SectorRoom extends Room {
   private simulate(dt: number): void {
     this.tick += 1;
 
+    const now = Date.now();
     for (const session of this.sessions.values()) {
-      const input = session.input;
-      if (!input) continue;
+      let input = session.input;
 
-      let dirX = input.dirX;
-      let dirZ = input.dirZ;
-      const length = Math.hypot(dirX, dirZ);
-      if (length > 1) {
-        dirX /= length;
-        dirZ /= length;
+      // Клиент замолчал (обрыв, вкладка в фоне) — не тащим его вперёд
+      // последним нажатием до бесконечности.
+      if (input && now - session.lastInputAt > INPUT_TTL_MS) {
+        input = null;
+        session.input = null;
       }
 
-      const moving = length > 0.01;
-      session.moving = moving;
-      session.sprinting = moving && input.sprint;
+      let moving = false;
+      if (input) {
+        let dirX = input.dirX;
+        let dirZ = input.dirZ;
+        const length = Math.hypot(dirX, dirZ);
+        if (length > 1) {
+          dirX /= length;
+          dirZ /= length;
+        }
 
-      if (moving) {
-        const speed = input.sprint ? PLAYER_SPRINT_SPEED : PLAYER_SPEED;
-        session.x += dirX * speed * dt;
-        session.z += dirZ * speed * dt;
+        moving = length > 0.01;
+        session.moving = moving;
+        session.sprinting = moving && input.sprint;
+
+        if (moving) {
+          const speed = input.sprint ? PLAYER_SPRINT_SPEED : PLAYER_SPEED;
+          session.x += dirX * speed * dt;
+          session.z += dirZ * speed * dt;
+        }
+
+        session.yaw = input.yaw;
+      } else {
+        session.moving = false;
+        session.sprinting = false;
       }
 
+      // Зона и порталы проверяются всегда, даже без ввода: игрок может
+      // стоять внутри портала, а после телепорта его позицию нужно
+      // разослать, не дожидаясь следующего нажатия.
       this.clampToZone(session);
       this.checkPortal(session);
 
@@ -366,7 +439,7 @@ export class SectorRoom extends Room {
         entity.x = session.x;
         entity.y = session.y;
         entity.z = session.z;
-        entity.yaw = input.yaw;
+        entity.yaw = session.yaw;
         entity.flags =
           (moving ? ENTITY_FLAG.Moving : 0) |
           (session.sprinting ? ENTITY_FLAG.Sprinting : 0);
@@ -387,6 +460,9 @@ export class SectorRoom extends Room {
 
   /** Портал переносит игрока в соседнюю зону. Решение принимает сервер. */
   private checkPortal(session: Session): void {
+    const now = Date.now();
+    if (now < session.teleportUntil) return;
+
     const fromZone = session.zoneId;
     if (!fromZone) return;
 
@@ -397,15 +473,33 @@ export class SectorRoom extends Room {
     );
     if (!portal) return;
 
-    const destination = this.world.portals.find(
+    const target = this.world.portals.find(
       (candidate) =>
         candidate.fromZone === portal.toZone && candidate.toZone === portal.fromZone,
     );
-    const target = destination ?? portal;
 
-    session.x = target.x;
-    session.z = target.z;
+    let x = target?.x ?? portal.x;
+    let z = target?.z ?? portal.z;
+
+    // Прибывать в центр обратного портала нельзя: на следующем тике игрок
+    // снова окажется внутри радиуса и улетит назад. Ставим его на шаг
+    // в сторону центра целевой зоны — то есть «за порогом» портала.
+    const destination = findZone(this.world, portal.toZone);
+    if (destination) {
+      const dx = destination.bounds.x - x;
+      const dz = destination.bounds.z - z;
+      const length = Math.hypot(dx, dz);
+      const step = (target?.radius ?? portal.radius) + 1.5;
+      if (length > 0.001) {
+        x += (dx / length) * step;
+        z += (dz / length) * step;
+      }
+    }
+
+    session.x = x;
+    session.z = z;
     session.zoneId = portal.toZone;
+    session.teleportUntil = now + PORTAL_COOLDOWN_MS;
 
     session.client.send(S2C.Teleport, {
       zoneId: portal.toZone,
@@ -473,8 +567,21 @@ export class SectorRoom extends Room {
 
   // ────────────────────────────────────────────────────────── экономика ────
 
-  private async grantGenesis(accountId: string, accountCreatedAt: number): Promise<number> {
-    const already = await this.ledger.hasEntry(this.world.id, accountId, 'genesis');
+  private grantGenesis(accountId: string, accountCreatedAt: number): Promise<number> {
+    const inFlight = this.genesisInFlight.get(accountId);
+    if (inFlight) return inFlight;
+
+    const task = this.doGrantGenesis(accountId, accountCreatedAt).finally(() => {
+      this.genesisInFlight.delete(accountId);
+    });
+    this.genesisInFlight.set(accountId, task);
+    return task;
+  }
+
+  private async doGrantGenesis(accountId: string, accountCreatedAt: number): Promise<number> {
+    // Валюта глобальная (см. docs/10), поэтому и грант — один на аккаунт,
+    // а не на мир. Иначе каждый новый мир печатал бы ещё 100 ¤.
+    const already = await this.ledger.hasEntry(accountId, 'genesis');
     if (already) return this.ledger.balanceOf(accountId);
 
     const age = Date.now() - accountCreatedAt;
@@ -518,4 +625,33 @@ function sameState(a: EntityState, b: EntityState): boolean {
     a.flags === b.flags &&
     a.color === b.color
   );
+}
+
+/** Имя — текст, который увидят другие. Убираем управляющие символы и мусор. */
+function sanitizeName(raw: string): string {
+  const cleaned = raw
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\u0000-\u001f\u007f-\u009f]/g, '')
+    .trim()
+    .slice(0, 24);
+  return cleaned.length > 0 ? cleaned : 'безымянный';
+}
+
+/**
+ * Точка спавна со сдвигом по «золотому углу». Без него все появляются
+ * в одной точке и стоят друг в друге — выглядит как один игрок.
+ */
+function spawnPoint(base: { x: number; y: number; z: number }, entityId: number): {
+  x: number;
+  y: number;
+  z: number;
+} {
+  if (entityId <= 1) return base;
+  const angle = entityId * 2.399963;
+  const radius = SPAWN_RADIUS * Math.sqrt(1 + (entityId % 8));
+  return {
+    x: base.x + Math.cos(angle) * radius,
+    y: base.y,
+    z: base.z + Math.sin(angle) * radius,
+  };
 }

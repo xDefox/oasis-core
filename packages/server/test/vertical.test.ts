@@ -24,6 +24,7 @@ import {
   type ChatBroadcastMsg,
   type EntityState,
   type RosterMsg,
+  type TeleportMsg,
   type WelcomeMsg,
 } from '@oasis/protocol';
 
@@ -38,6 +39,7 @@ interface Recorder {
   welcome?: WelcomeMsg;
   roster?: RosterMsg;
   chats: ChatBroadcastMsg[];
+  teleports: TeleportMsg[];
   balance?: number;
   snapshots: { tick: number; entities: EntityState[] }[];
   deltas: { tick: number; changed: EntityState[]; removed: number[] }[];
@@ -47,7 +49,7 @@ function recorder(room: {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   onMessage(type: string, callback: (message: any) => void): unknown;
 }): Recorder {
-  const record: Recorder = { chats: [], snapshots: [], deltas: [] };
+  const record: Recorder = { chats: [], teleports: [], snapshots: [], deltas: [] };
   room.onMessage('welcome', (message: WelcomeMsg) => {
     record.welcome = message;
   });
@@ -59,6 +61,9 @@ function recorder(room: {
   });
   room.onMessage('balance', (message: { balance: number }) => {
     record.balance = message.balance;
+  });
+  room.onMessage('teleport', (message: TeleportMsg) => {
+    record.teleports.push(message);
   });
   room.onMessage(BIN_CHANNEL, (payload: Uint8Array) => {
     if (payload[0] === 1) {
@@ -101,15 +106,30 @@ async function waitFor<T>(
 describe('вертикальный срез: два игрока видят друг друга, двигаются, общаются', () => {
   let gameServer: Server;
   let world: Awaited<ReturnType<typeof loadWorld>>;
+  /** Мир для теста порталов: спавн стоит прямо в портале, зоны — те же. */
+  let portalWorld: Awaited<ReturnType<typeof loadWorld>>;
 
   before(async () => {
     world = await loadWorld(config.worldPath);
+
+    portalWorld = structuredClone(world);
+    portalWorld.sectors[0]!.spawn = { x: 0, y: 0, z: 0 };
+    portalWorld.portals = [
+      { id: 'p_test_in', fromZone: 'z_plaza', toZone: 'z_grove', x: 2, z: 0, radius: 3 },
+      { id: 'p_test_out', fromZone: 'z_grove', toZone: 'z_plaza', x: 92, z: 0, radius: 3 },
+    ];
+
     const ledger = new MemoryLedger();
     const httpServer = http.createServer();
     gameServer = new Server({
       transport: new WebSocketTransport({ server: httpServer }),
     });
     gameServer.define('sector', SectorRoom, { world, ledger, maxPlayers: 16 });
+    gameServer.define('sector_portal', SectorRoom, {
+      world: portalWorld,
+      ledger,
+      maxPlayers: 16,
+    });
     await gameServer.listen(PORT);
   });
 
@@ -244,6 +264,37 @@ describe('вертикальный срез: два игрока видят др
 
     await alphaRoom.leave();
     await betaRoom.leave();
+  });
+
+  it('телепортирует через портал и не отправляет обратно (регрессия пинг-понга)', async () => {
+    const client = new Client(`ws://localhost:${PORT}`);
+    const room = await client.joinOrCreate('sector_portal', {
+      protocolVersion: PROTOCOL_VERSION,
+      accountId: 'acct_test_portal_04',
+      accountCreatedAt: Date.now() - 5 * 24 * 60 * 60 * 1000,
+      name: 'portal',
+    });
+    const record = recorder(room);
+    room.send('hello', { protocolVersion: PROTOCOL_VERSION });
+
+    const teleport = await waitFor(() => record.teleports[0], 8000, 'телепорт');
+    assert.equal(teleport.zoneId, 'z_grove');
+
+    // Прибытие должно быть ЗА порталом возврата, иначе следующий тик
+    // отправит игрока обратно и так до бесконечности.
+    const arrival = teleport.position;
+    const backPortal = portalWorld.portals.find((portal) => portal.id === 'p_test_out')!;
+    const distanceToBack = Math.hypot(arrival.x - backPortal.x, arrival.z - backPortal.z);
+    assert.ok(
+      distanceToBack > backPortal.radius,
+      `прибытие внутри обратного портала: ${distanceToBack.toFixed(2)} м`,
+    );
+
+    // Стоим на месте дольше кулдауна — второго телепорта быть не должно.
+    await new Promise((resolve) => setTimeout(resolve, 1600));
+    assert.equal(record.teleports.length, 1, 'игрока унесло обратно');
+
+    await room.leave();
   });
 
   it('отказывает клиенту с чужой версией протокола', async () => {

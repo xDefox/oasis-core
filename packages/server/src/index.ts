@@ -48,6 +48,9 @@ async function main(): Promise<void> {
   const httpServer = http.createServer(app);
   const gameServer = new Server({
     transport: new WebSocketTransport({ server: httpServer }),
+    // Свои SIGINT/SIGTERM ниже: иначе Colyseus и мы гасим сервер
+    // одновременно и второй получает already_shutting_down.
+    gracefullyShutdown: false,
   });
 
   gameServer.define('sector', SectorRoom, {
@@ -57,6 +60,26 @@ async function main(): Promise<void> {
   });
 
   await gameServer.listen(config.port, config.host);
+
+  // Аккуратное завершение: закрыть комнаты, потом пул Postgres.
+  // Без этого `docker stop`/systemd убивает процесс с открытыми сокетами,
+  // а коллекции остаются висеть в базе.
+  let stopping = false;
+  const shutdown = async (signal: string): Promise<void> => {
+    if (stopping) return;
+    stopping = true;
+    logInfo(`останавливаюсь по ${signal}`);
+    try {
+      await gameServer.gracefullyShutdown(false);
+      await store.ledger.close();
+    } catch (error) {
+      logError('ошибка при остановке', { error: String(error) });
+    } finally {
+      process.exit(0);
+    }
+  };
+  process.on('SIGINT', () => void shutdown('SIGINT'));
+  process.on('SIGTERM', () => void shutdown('SIGTERM'));
 
   logInfo(`сервер поднят`, {
     url: `http://${config.host}:${config.port}`,

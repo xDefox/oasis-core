@@ -16,6 +16,7 @@ import {
   type ErrorMsg,
   type HelloMsg,
   type InputMsg,
+  type PongMsg,
   type RosterMsg,
   type TeleportMsg,
   type WelcomeMsg,
@@ -30,15 +31,17 @@ export interface ConnectionHandlers {
   onTeleport(message: TeleportMsg): void;
   onBalance(message: { balance: number; reason: string }): void;
   onBinary(payload: Uint8Array): void;
+  onPong(message: PongMsg): void;
   onError(message: ErrorMsg): void;
   onStatus(status: 'connecting' | 'open' | 'closed' | 'error', detail?: string): void;
 }
 
 export class Connection {
   private room: Room | null = null;
+  private closed = false;
 
   get connected(): boolean {
-    return this.room !== null;
+    return this.room !== null && !this.closed;
   }
 
   async connect(serverUrl: string, hello: HelloMsg, handlers: ConnectionHandlers): Promise<void> {
@@ -47,6 +50,7 @@ export class Connection {
     const client = new Client(serverUrl);
     const room = await client.joinOrCreate('sector', hello);
     this.room = room;
+    this.closed = false;
 
     room.onMessage('welcome', (message: WelcomeMsg) => handlers.onWelcome(message));
     room.onMessage('roster', (message: RosterMsg) => handlers.onRoster(message));
@@ -56,11 +60,18 @@ export class Connection {
     room.onMessage('balance', (message: { balance: number; reason: string }) =>
       handlers.onBalance(message),
     );
+    room.onMessage('pong', (message: PongMsg) => handlers.onPong(message));
     room.onMessage('error', (message: ErrorMsg) => handlers.onError(message));
     room.onMessage(BIN_CHANNEL, (payload: Uint8Array) => handlers.onBinary(payload));
 
-    room.onError((code, message) => handlers.onStatus('error', `${code}: ${message}`));
-    room.onLeave(() => handlers.onStatus('closed'));
+    room.onError((code, message) => {
+      handlers.onStatus('error', `${code}: ${message}`);
+      this.markClosed();
+    });
+    room.onLeave(() => {
+      handlers.onStatus('closed');
+      this.markClosed();
+    });
 
     // Явный handshake: сервер присылает мир только в ответ на hello.
     // Это гарантирует, что обработчики выше уже зарегистрированы.
@@ -69,25 +80,35 @@ export class Connection {
     handlers.onStatus('open');
   }
 
+  private markClosed(): void {
+    this.closed = true;
+    this.room = null;
+  }
+
   /** Ввод идёт бинарным: 30 Гц × N игроков — заметная доля трафика. */
   sendInput(input: InputMsg): void {
+    if (!this.connected) return;
     this.room?.sendBytes(BIN_CHANNEL, encodeInput(input));
   }
 
   sendChat(text: string): void {
+    if (!this.connected) return;
     this.room?.send(C2S.Chat, { text });
   }
 
   requestZone(zoneId: string): void {
+    if (!this.connected) return;
     this.room?.send(C2S.ZoneRequest, { zoneId });
   }
 
   ping(t: number): void {
+    if (!this.connected) return;
     this.room?.send(C2S.Ping, { t });
   }
 
   leave(): void {
-    void this.room?.leave();
-    this.room = null;
+    const room = this.room;
+    this.markClosed();
+    if (room) void room.leave();
   }
 }

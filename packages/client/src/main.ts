@@ -21,7 +21,6 @@ import {
   decodeDelta,
   decodeSnapshot,
   type ChatBroadcastMsg,
-  type EntityState,
   type PortalDef,
   type RosterMsg,
   type TeleportMsg,
@@ -34,14 +33,15 @@ import { Input } from './input/Input.ts';
 import { Connection } from './net/Connection.ts';
 import { LocalPlayer } from './net/LocalPlayer.ts';
 import { INTERP_DELAY_MS, StateStore } from './net/StateStore.ts';
-import { createAvatar, createNameTag } from './render/avatars.ts';
+import { createAvatar, createNameTag, setNameTag } from './render/avatars.ts';
 import { createRenderer } from './render/Renderer.ts';
 import { buildPortal, buildZone, disposeGroup } from './render/world.ts';
 import { Hud } from './ui/Hud.ts';
 
+/** На HTTPS-странице ws:// блокируется браузером как mixed content. */
 const SERVER_URL =
   (import.meta.env.VITE_SERVER_URL as string | undefined) ??
-  `ws://${window.location.hostname}:2567`;
+  `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.hostname}:2567`;
 
 const ACCOUNT_KEY = 'oasis.account';
 const NAME_KEY = 'oasis.name';
@@ -89,6 +89,7 @@ async function main(): Promise<void> {
   let zoneSummaries: ZoneSummary[] = [];
   let worldPortals: PortalDef[] = [];
   let balance = 0;
+  let lastReconciledTick = -1;
 
   const zoneGroups = new Map<string, Group>();
   const avatarGroups = new Map<number, Group>();
@@ -97,8 +98,9 @@ async function main(): Promise<void> {
 
   const hud = new Hud({
     onChat: (text) => connection.sendChat(text),
-    onChatFocusChange: () => {
-      /* курсор живёт сам */
+    onChatFocusChange: (focused) => {
+      // Пока печатаешь — мышь не должна крутить камеру.
+      if (focused) document.exitPointerLock?.();
     },
   });
 
@@ -136,6 +138,28 @@ async function main(): Promise<void> {
     return nearest;
   }
 
+  /** Аватары — событие ростера, а не таймер. Имя тоже обновляем здесь. */
+  function syncAvatars(): void {
+    for (const player of state.roster.values()) {
+      let group = avatarGroups.get(player.id);
+      if (!group) {
+        group = createAvatar(player.color);
+        const tag = createNameTag(player.name, player.color);
+        tag.name = 'tag';
+        group.add(tag);
+        sceneRoot.add(group);
+        avatarGroups.set(player.id, group);
+      } else {
+        setNameTag(group, player.name, player.color);
+      }
+    }
+    for (const [id, group] of avatarGroups) {
+      if (state.roster.has(id)) continue;
+      disposeGroup(group);
+      avatarGroups.delete(id);
+    }
+  }
+
   // ── обработчики сети ───────────────────────────────────────────────────
 
   const handlers = {
@@ -157,6 +181,7 @@ async function main(): Promise<void> {
 
     onRoster(message: RosterMsg): void {
       state.setRoster(message.players);
+      syncAvatars();
     },
 
     onChat(message: ChatBroadcastMsg): void {
@@ -177,17 +202,19 @@ async function main(): Promise<void> {
 
       // Если игрок уже в этой зоне — обновляем границы предсказания.
       if (localPlayer) {
-        const own = state.latest(state.localPlayerId);
-        if (own) {
-          const at = zoneAt(own.x, own.z);
-          if (at?.id === zone.id) localPlayer.setBounds(zone.bounds);
-        }
+        const at = zoneAt(localPlayer.x, localPlayer.z);
+        if (at?.id === zone.id) localPlayer.setBounds(zone.bounds);
       }
     },
 
     onTeleport(message: TeleportMsg): void {
+      // Сначала границы новой зоны, потом мгновенный перенос: иначе clamp
+      // старой зоны «дёрнет» предсказание до того, как мы узнаем, куда едем.
       const zone = zoneSummaries.find((candidate) => candidate.id === message.zoneId);
-      if (zone && localPlayer) localPlayer.setBounds(zone.bounds);
+      if (localPlayer) {
+        localPlayer.setBounds(zone?.bounds ?? null);
+        localPlayer.teleportTo(message.position.x, message.position.z);
+      }
       requestZone(message.zoneId);
       hud.addChatLine(null, `переход в зону ${message.zoneId}`);
     },
@@ -196,16 +223,38 @@ async function main(): Promise<void> {
       balance = message.balance;
     },
 
+    onPong(message: { t: number; serverTime: number }): void {
+      const rtt = Date.now() - message.t;
+      if (Number.isFinite(rtt) && rtt >= 0) ping = Math.min(rtt, 9_999);
+    },
+
     onBinary(payload: Uint8Array): void {
       const now = performance.now();
       if (payload.byteLength === 0) return;
-      const type = payload[0];
-      if (type === BIN.Snapshot) {
-        const decoded = decodeSnapshot(payload);
-        state.applySnapshot(decoded.entities, decoded.tick, now);
-      } else if (type === BIN.Delta) {
-        const decoded = decodeDelta(payload);
-        state.applyDelta(decoded.changed, decoded.removed, decoded.tick, now);
+
+      let tick = -1;
+      try {
+        const type = payload[0];
+        if (type === BIN.Snapshot) {
+          const decoded = decodeSnapshot(payload);
+          state.applySnapshot(decoded.entities, decoded.tick, now);
+          tick = decoded.tick;
+        } else if (type === BIN.Delta) {
+          const decoded = decodeDelta(payload);
+          state.applyDelta(decoded.changed, decoded.removed, decoded.tick, now);
+          tick = decoded.tick;
+        }
+      } catch (error) {
+        // Битая посылка не должна убивать цикл кадров.
+        console.warn('не удалось разобрать бинарный пакет', error);
+        return;
+      }
+
+      // Сверка — ровно один раз на новый авторитетный снимок.
+      if (localPlayer && tick >= 0 && tick !== lastReconciledTick) {
+        lastReconciledTick = tick;
+        const own = state.latest(state.localPlayerId);
+        if (own) localPlayer.reconcile(own);
       }
     },
 
@@ -248,32 +297,12 @@ async function main(): Promise<void> {
     if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) return;
     if (event.code === 'Enter') {
       event.preventDefault();
+      // Иначе pointer lock продолжает слать mousemove, и камера крутится
+      // в такт печати.
+      document.exitPointerLock?.();
       hud.focusChat();
     }
   });
-
-  // ── аватары ────────────────────────────────────────────────────────────
-
-  function syncAvatars(): void {
-    for (const player of state.roster.values()) {
-      let group = avatarGroups.get(player.id);
-      if (!group) {
-        group = createAvatar(player.color);
-        const tag = createNameTag(player.name, player.color);
-        tag.name = 'tag';
-        group.add(tag);
-        sceneRoot.add(group);
-        avatarGroups.set(player.id, group);
-      }
-    }
-    for (const [id, group] of avatarGroups) {
-      if (state.roster.has(id)) continue;
-      disposeGroup(group);
-      avatarGroups.delete(id);
-    }
-  }
-
-  const rosterObserver = setInterval(syncAvatars, 400);
 
   // ── цикл кадра ─────────────────────────────────────────────────────────
 
@@ -319,24 +348,30 @@ async function main(): Promise<void> {
       }
     }
 
-    // 4. сверка с сервером
-    const ownAuthoritative = state.latest(state.localPlayerId);
-    if (ownAuthoritative && localPlayer) localPlayer.reconcile(ownAuthoritative);
-
-    // 5. интерполяция и отрисовка
+    // 4. интерполяция и отрисовка
     const renderTime = now - INTERP_DELAY_MS;
     const snapshot = state.sampleAt(renderTime);
 
     for (const [id, group] of avatarGroups) {
+      if (id === state.localPlayerId) continue;
       const entity = snapshot.get(id);
       if (!entity) continue;
       group.position.set(entity.x, entity.y, entity.z);
       group.rotation.y = entity.yaw;
     }
 
-    updateLocalAvatar(snapshot.get(state.localPlayerId));
+    // Свой аватар — по предсказанию, а не по интерполированному снимку:
+    // снимок отстаёт на INTERP_DELAY_MS, и камера уезжала бы от тела.
+    if (localPlayer) {
+      const own = avatarGroups.get(state.localPlayerId);
+      if (own) {
+        own.position.set(localPlayer.x, 0, localPlayer.z);
+        own.rotation.y = input.yaw;
+      }
+    }
 
-    // Камера: вид от третьего лица.
+    // Камера: вид от третьего лица. Сглаживание — по времени, а не по кадрам,
+    // иначе на 144 Гц камера «прилипает» быстрее, чем на 60.
     if (localPlayer) {
       const pitch = input.pitch;
       const yaw = input.yaw;
@@ -345,15 +380,16 @@ async function main(): Promise<void> {
         Math.sin(pitch),
         -Math.cos(yaw) * Math.cos(pitch),
       );
-      cameraTarget.set(localPlayer.renderX, 1.4, localPlayer.renderZ);
+      cameraTarget.set(localPlayer.x, 1.4, localPlayer.z);
       cameraPosition.copy(cameraTarget).addScaledVector(lookDirection, -4.2);
-      camera.position.lerp(cameraPosition, 0.25);
+      const smoothing = 1 - Math.exp(-deltaMs / 60);
+      camera.position.lerp(cameraPosition, smoothing);
       camera.lookAt(cameraTarget);
     }
 
     renderer.render(scene, camera);
 
-    // 6. статистика и пинг
+    // 5. статистика и пинг
     fpsAccumulator += deltaMs;
     fpsFrames += 1;
     if (fpsAccumulator >= 500) {
@@ -370,20 +406,7 @@ async function main(): Promise<void> {
     }
   }
 
-  function updateLocalAvatar(entity: EntityState | undefined): void {
-    const group = avatarGroups.get(state.localPlayerId);
-    if (!group) return;
-    if (entity) {
-      group.position.set(entity.x, entity.y, entity.z);
-      group.rotation.y = entity.yaw;
-    } else if (localPlayer) {
-      group.position.set(localPlayer.renderX, 0, localPlayer.renderZ);
-      group.rotation.y = input.yaw;
-    }
-  }
-
   window.addEventListener('beforeunload', () => {
-    clearInterval(rosterObserver);
     connection.leave();
   });
 

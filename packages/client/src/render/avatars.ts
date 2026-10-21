@@ -7,7 +7,6 @@
 
 import {
   CanvasTexture,
-  Color,
   Group,
   Mesh,
   MeshLambertMaterial,
@@ -57,7 +56,27 @@ export function createNameTag(name: string, color: number): Sprite {
   sprite.scale.set(1.8, 0.45, 1);
   sprite.position.y = AVATAR_HEIGHT + 0.75;
   sprite.renderOrder = 10;
+  sprite.userData.name = name;
+  sprite.userData.color = color;
   return sprite;
+}
+
+/**
+ * Обновляет подпись, только если имя/цвет реально изменились.
+ * Ростер приходит на каждое подключение и отключение — перерисовывать
+ * canvas каждый раз бессмысленно.
+ */
+export function setNameTag(group: Group, name: string, color: number): void {
+  const tag = group.getObjectByName('tag') as Sprite | undefined;
+  if (!tag) return;
+  if (tag.userData.name === name && tag.userData.color === color) return;
+
+  const material = tag.material as SpriteMaterial;
+  material.map?.dispose();
+  material.map = nameTexture(name, color);
+  material.needsUpdate = true;
+  tag.userData.name = name;
+  tag.userData.color = color;
 }
 
 function nameTexture(name: string, color: number): CanvasTexture {
@@ -82,12 +101,4 @@ function nameTexture(name: string, color: number): CanvasTexture {
   const texture = new CanvasTexture(canvas);
   texture.anisotropy = 4;
   return texture;
-}
-
-/** Цвет игрока по id — детерминированный, чтобы не мигал при обновлениях. */
-export function colorForId(id: number): Color {
-  const palette = [
-    0x4fa3ff, 0xff7a59, 0x6fcf7f, 0xffd166, 0xc792ea, 0x59d4d4, 0xff8fa3, 0x9ad36f,
-  ];
-  return new Color(palette[Math.abs(id) % palette.length]!);
 }

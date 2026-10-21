@@ -13,8 +13,13 @@ export interface Ledger {
   append(entry: Omit<LedgerEntry, 'id' | 'ts'>): Promise<LedgerEntry>;
   balanceOf(accountId: string): Promise<number>;
   totalSupply(worldId: string): Promise<number>;
-  /** Была ли уже проводка такого kind для этого аккаунта в этом мире. */
-  hasEntry(worldId: string, accountId: string, kind: LedgerKind): Promise<boolean>;
+  /**
+   * Была ли уже проводка такого kind для аккаунта.
+   *
+   * Мир здесь намеренно не участвует: баланс и, например, genesis-грант —
+   * глобальные для аккаунта. Иначе каждый новый мир печатал бы новый грант.
+   */
+  hasEntry(accountId: string, kind: LedgerKind): Promise<boolean>;
   close(): Promise<void>;
 }
 
@@ -47,12 +52,9 @@ export class MemoryLedger implements Ledger {
     return sum;
   }
 
-  async hasEntry(worldId: string, accountId: string, kind: LedgerKind): Promise<boolean> {
+  async hasEntry(accountId: string, kind: LedgerKind): Promise<boolean> {
     return this.entries.some(
-      (entry) =>
-        entry.worldId === worldId &&
-        entry.accountId === accountId &&
-        entry.kind === kind,
+      (entry) => entry.accountId === accountId && entry.kind === kind,
     );
   }
 

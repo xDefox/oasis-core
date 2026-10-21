@@ -6,19 +6,24 @@
  */
 
 import { z } from 'zod';
-import { MAX_CHAT_LENGTH } from './constants.ts';
 
 export const helloSchema = z.object({
   protocolVersion: z.string().min(1).max(32),
   accountId: z.string().min(8).max(64),
   accountCreatedAt: z.number().int().nonnegative(),
-  name: z.string().min(1).max(24),
+  // trim здесь, потому что имя уходит в ростер и в подпись над головой.
+  name: z.string().trim().min(1).max(24),
 });
 
+/**
+ * Ввод намеренно мягкий: сервер всё равно нормализует вектор и ограничивает
+ * скорость. Строгие границы здесь означали бы «клиент с багом отключён»,
+ * а нам нужен предсказуемый мир, а не наказание за кривой float.
+ */
 export const inputSchema = z.object({
   seq: z.number().int().nonnegative(),
-  dirX: z.number().finite().min(-1).max(1),
-  dirZ: z.number().finite().min(-1).max(1),
+  dirX: z.number().finite(),
+  dirZ: z.number().finite(),
   yaw: z.number().finite(),
   sprint: z.boolean(),
 });
@@ -27,8 +32,13 @@ export const helloHandshakeSchema = z.object({
   protocolVersion: z.string().min(1).max(32),
 });
 
+/**
+ * Лимит схемы выше игрового: сообщение длиннее 240 символов обрезается
+ * на сервере, а не превращается в дисконнект (Colyseus рвёт соединение
+ * при провале валидатора).
+ */
 export const chatSchema = z.object({
-  text: z.string().min(1).max(MAX_CHAT_LENGTH),
+  text: z.string().min(1).max(4096),
 });
 
 export const zoneRequestSchema = z.object({
@@ -103,7 +113,8 @@ export const worldSchema = z.object({
   seed: z.number().int(),
   generator: z.string().min(1),
   sectors: z.array(sectorSchema).min(1),
-  zones: z.array(zoneSchema),
+  // Мир без зон — это мир, в котором негде стоять.
+  zones: z.array(zoneSchema).min(1),
   portals: z.array(portalSchema),
 });
 

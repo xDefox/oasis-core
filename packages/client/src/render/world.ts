@@ -35,6 +35,13 @@ interface GeometryCache {
 /** Кэш геометрий: пропсы одного типа делят одну геометрию. */
 let geometryCache: GeometryCache | null = null;
 
+/**
+ * Общие геометрии живут столько же, сколько приложение. Их нельзя
+ * диспозить при выгрузке зоны: соседние зоны пользуются теми же объектами,
+ * и первая же выгрузка превратила бы их в пустоту.
+ */
+const sharedGeometries = new Set<BufferGeometry>();
+
 function geometries(): GeometryCache {
   if (geometryCache) return geometryCache;
   geometryCache = {
@@ -43,6 +50,7 @@ function geometries(): GeometryCache {
     sphere: new SphereGeometry(0.5, 14, 10),
     cone: new ConeGeometry(0.5, 1, 12),
   };
+  for (const geometry of Object.values(geometryCache)) sharedGeometries.add(geometry);
   return geometryCache;
 }
 
@@ -137,17 +145,26 @@ export function buildPortal(portal: PortalDef): Group {
   return group;
 }
 
-/** Удаляет геометрию и материалы группы (при выгрузке зоны). */
+/**
+ * Удаляет ресурсы группы (при выгрузке зоны или отключении игрока).
+ *
+ * Общие (кэшированные) геометрии не трогаем — они не принадлежат группе.
+ * Текстуры материалов диспозим отдельно: material.dispose() её не освобождает.
+ */
 export function disposeGroup(group: Group): void {
   group.traverse((child: Object3D) => {
     const mesh = child as Mesh;
     if (!mesh.isMesh) return;
-    mesh.geometry?.dispose?.();
-    const material = mesh.material;
-    if (Array.isArray(material)) {
-      for (const item of material) item.dispose();
-    } else {
-      material?.dispose?.();
+
+    const geometry = mesh.geometry;
+    if (geometry && !sharedGeometries.has(geometry)) geometry.dispose();
+
+    const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+    for (const material of materials) {
+      if (!material) continue;
+      const map = (material as MeshStandardMaterial).map;
+      map?.dispose();
+      material.dispose();
     }
   });
   group.removeFromParent();

@@ -24,22 +24,31 @@ export class PostgresLedger implements Ledger {
 
   async append(entry: AppendInput): Promise<LedgerEntry> {
     const full: LedgerEntry = { ...entry, id: randomUUID(), ts: Date.now() };
-    await this.pool.query(
-      `insert into ledger_entries
-         (id, ts, world_id, account_id, kind, amount, reason, counterparty_id, meta)
-       values ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-      [
-        full.id,
-        full.ts,
-        full.worldId,
-        full.accountId,
-        full.kind,
-        full.amount,
-        full.reason,
-        full.counterpartyId ?? null,
-        JSON.stringify(full.meta ?? {}),
-      ],
-    );
+    try {
+      await this.pool.query(
+        `insert into ledger_entries
+           (id, ts, world_id, account_id, kind, amount, reason, counterparty_id, meta)
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        [
+          full.id,
+          full.ts,
+          full.worldId,
+          full.accountId,
+          full.kind,
+          full.amount,
+          full.reason,
+          full.counterpartyId ?? null,
+          JSON.stringify(full.meta ?? {}),
+        ],
+      );
+    } catch (error) {
+      // 23505 = unique_violation. Повторный genesis — не ошибка: значит,
+      // параллельная вкладка уже начислила. Отдаём существующий баланс.
+      if (entry.kind === 'genesis' && (error as { code?: string }).code === '23505') {
+        return full;
+      }
+      throw error;
+    }
     return full;
   }
 
@@ -59,12 +68,12 @@ export class PostgresLedger implements Ledger {
     return Number(result.rows[0]?.supply ?? 0);
   }
 
-  async hasEntry(worldId: string, accountId: string, kind: LedgerKind): Promise<boolean> {
+  async hasEntry(accountId: string, kind: LedgerKind): Promise<boolean> {
     const result = await this.pool.query(
       `select 1 from ledger_entries
-        where world_id = $1 and account_id = $2 and kind = $3
+        where account_id = $1 and kind = $2
         limit 1`,
-      [worldId, accountId, kind],
+      [accountId, kind],
     );
     return (result.rowCount ?? 0) > 0;
   }
@@ -90,8 +99,14 @@ export class PostgresLedger implements Ledger {
         );
         create index if not exists ledger_entries_account_idx on ledger_entries (account_id);
         create index if not exists ledger_entries_world_idx on ledger_entries (world_id);
-        create index if not exists ledger_entries_genesis_idx
-          on ledger_entries (world_id, account_id, kind);
+        create index if not exists ledger_entries_account_kind_idx
+          on ledger_entries (account_id, kind);
+
+        -- Genesis нельзя начислить дважды даже при гонке двух вкладок:
+        -- уникальность держит база, а не только проверка в коде.
+        create unique index if not exists ledger_entries_genesis_uniq
+          on ledger_entries (account_id)
+          where kind = 'genesis';
       `);
     } catch (error) {
       logError('миграция ledger провалилась', { error: String(error) });

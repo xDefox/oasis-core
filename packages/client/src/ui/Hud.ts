@@ -86,6 +86,7 @@ export class Hud {
   }
 
   private setChatFocused(focused: boolean): void {
+    if (this.chatFocused === focused) return;
     this.chatFocused = focused;
     this.chatForm.hidden = !focused;
     this.hint.style.opacity = focused ? '0.25' : '1';
@@ -93,8 +94,8 @@ export class Hud {
       this.chatInput.focus();
     } else {
       this.chatInput.blur();
-      this.callbacks.onChatFocusChange(false);
     }
+    this.callbacks.onChatFocusChange(focused);
   }
 
   addChatLine(who: string | null, text: string): void {
