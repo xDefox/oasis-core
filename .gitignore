@@ -1,0 +1,45 @@
+# --- Node / JS ---
+node_modules/
+dist/
+build/
+.cache/
+*.tsbuildinfo
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# --- Env / secrets ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# --- Runtime / data ---
+*.log
+logs/
+tmp/
+data/
+uploads/
+*.sqlite
+*.sqlite3
+*.db
+dump.rdb
+
+# --- Editors / OS ---
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# --- Build artifacts / coverage ---
+coverage/
+.nyc_output/
+target/
+*.wasm.map
+
+# --- Local infra ---
+docker-compose.override.yml
+*.local
