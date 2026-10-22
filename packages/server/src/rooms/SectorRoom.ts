@@ -26,8 +26,6 @@ import {
   GENESIS_ACCOUNT_MIN_AGE_MS,
   GENESIS_FRESH_ACCOUNT_FACTOR,
   GENESIS_GRANT,
-  PLAYER_SPRINT_SPEED,
-  PLAYER_SPEED,
   PROTOCOL_VERSION,
   S2C,
   SNAPSHOT_RATE,
@@ -36,6 +34,8 @@ import {
   encodeDelta,
   encodeSnapshot,
   isProtocolCompatible,
+  speedOf,
+  stepVelocity,
   type EntityState,
   type HelloMsg,
   type PlayerInfo,
@@ -83,6 +83,9 @@ interface Session {
   zoneId: string | null;
   /** До какого момента порталы игнорируются (после телепорта). */
   teleportUntil: number;
+  /** Скорость в м/с: разгон и торможение живут на сервере, клиент их повторяет. */
+  vx: number;
+  vz: number;
   /** Когда пришёл последний ввод — по нему считаем TTL. */
   lastInputAt: number;
   lastZoneRequestAt: number;
@@ -100,7 +103,7 @@ const HANDSHAKE_TIMEOUT_MS = 10_000;
 /** Пауза после телепорта: без неё игрок пинг-понгом летает между зонами. */
 const PORTAL_COOLDOWN_MS = 1_200;
 /** Ввод считается протухшим: клиент, переставший слать пакеты, должен замереть. */
-const INPUT_TTL_MS = 500;
+const INPUT_TTL_MS = 1_000;
 /** Не чаще одного запроса зоны в 250 мс (зона весит десятки килобайт JSON). */
 const ZONE_REQUEST_COOLDOWN_MS = 250;
 /** Радиус кольца спавна: игроки не появляются друг в друге. */
@@ -151,7 +154,10 @@ export class SectorRoom extends Room {
         session.yaw = input.yaw;
         session.lastInputAt = Date.now();
       } catch (error) {
-        logWarn('бинарный ввод не распознан', { error: String(error) });
+        logWarn('бинарный ввод не распознан', {
+          bytes: bytes.byteLength,
+          error: String(error),
+        });
       }
     });
 
@@ -289,11 +295,22 @@ export class SectorRoom extends Room {
       return;
     }
 
-    const spawn = spawnPoint(sector.spawn ?? { x: 0, y: 0, z: 0 }, this.nextEntityId);
+    // Имя должно быть уникальным внутри сектора: игрок опознаёт других
+    // только по нему. Две вкладки одного браузера делят localStorage и
+    // присылают одинаковый ник — сервер разводит их суффиксом. Суффикс
+    // считается до спавна: точка спавна зависит от итогового имени.
+    const name = this.uniqueName(sanitizeName(hello.name));
+
+    // Детерминированный спавн: одинаковое имя — одинаковая точка. Иначе
+    // тесты и зонды зависят от порядка подключения, а игроки в центре
+    // площади толпятся там, где и так тесно.
+    const spawn = spawnPoint(
+      sector.spawn ?? { x: 0, y: 0, z: 0 },
+      hashSeed(`${this.world.id}:${name}`),
+    );
     const entityId = this.nextEntityId++;
     const color = PLAYER_COLORS[entityId % PLAYER_COLORS.length]!;
     const sessionId = client.sessionId;
-    const name = sanitizeName(hello.name);
 
     const session: Session = {
       client,
@@ -313,6 +330,8 @@ export class SectorRoom extends Room {
       chatTimestamps: [],
       balance: 0,
       zoneId: null,
+      vx: 0,
+      vz: 0,
       teleportUntil: 0,
       lastInputAt: 0,
       lastZoneRequestAt: 0,
@@ -337,6 +356,7 @@ export class SectorRoom extends Room {
     client.send(S2C.Welcome, {
       protocolVersion: PROTOCOL_VERSION,
       playerId: entityId,
+      name,
       sessionId,
       world: {
         id: this.world.id,
@@ -402,37 +422,34 @@ export class SectorRoom extends Room {
         session.input = null;
       }
 
-      let moving = false;
-      if (input) {
-        let dirX = input.dirX;
-        let dirZ = input.dirZ;
-        const length = Math.hypot(dirX, dirZ);
-        if (length > 1) {
-          dirX /= length;
-          dirZ /= length;
-        }
+      const dirX = input?.dirX ?? 0;
+      const dirZ = input?.dirZ ?? 0;
+      const sprint = input?.sprint ?? false;
 
-        moving = length > 0.01;
-        session.moving = moving;
-        session.sprinting = moving && input.sprint;
+      const velocity = stepVelocity(session.vx, session.vz, dirX, dirZ, sprint, dt);
+      session.vx = velocity.vx;
+      session.vz = velocity.vz;
 
-        if (moving) {
-          const speed = input.sprint ? PLAYER_SPRINT_SPEED : PLAYER_SPEED;
-          session.x += dirX * speed * dt;
-          session.z += dirZ * speed * dt;
-        }
-
-        session.yaw = input.yaw;
-      } else {
-        session.moving = false;
-        session.sprinting = false;
-      }
+      session.x += session.vx * dt;
+      session.z += session.vz * dt;
+      if (input) session.yaw = input.yaw;
 
       // Зона и порталы проверяются всегда, даже без ввода: игрок может
       // стоять внутри портала, а после телепорта его позицию нужно
       // разослать, не дожидаясь следующего нажатия.
+      const beforeX = session.x;
+      const beforeZ = session.z;
       this.clampToZone(session);
+      // Упёрлись в границу — гасим скорость в эту сторону, иначе игрок
+      // продолжает «давить» в стену и после отпускания клавиши.
+      if (session.x !== beforeX) session.vx = 0;
+      if (session.z !== beforeZ) session.vz = 0;
+
       this.checkPortal(session);
+
+      const speed = speedOf(session.vx, session.vz);
+      session.moving = speed > 0.2;
+      session.sprinting = session.moving && sprint;
 
       const entity = this.entities.get(session.entityId);
       if (entity) {
@@ -441,10 +458,32 @@ export class SectorRoom extends Room {
         entity.z = session.z;
         entity.yaw = session.yaw;
         entity.flags =
-          (moving ? ENTITY_FLAG.Moving : 0) |
+          (session.moving ? ENTITY_FLAG.Moving : 0) |
           (session.sprinting ? ENTITY_FLAG.Sprinting : 0);
       }
     }
+  }
+
+  /**
+   * Делает имя уникальным внутри сектора: `гость` → `гость (2)`.
+   *
+   * Сравнение без учёта регистра — иначе `Гость` и `гость` стоят рядом и
+   * путаница та же. Суффикс уходит в обычный текст, так что длина имени
+   * может слегка превысить лимит 24 знака: это дешевле, чем обрезать
+   * суффикс и снова получить дубль.
+   */
+  private uniqueName(base: string): string {
+    const taken = new Set<string>();
+    for (const session of this.sessions.values()) {
+      taken.add(session.name.toLowerCase());
+    }
+    if (!taken.has(base.toLowerCase())) return base;
+
+    for (let suffix = 2; suffix <= 999; suffix += 1) {
+      const candidate = `${base} (${suffix})`;
+      if (!taken.has(candidate.toLowerCase())) return candidate;
+    }
+    return `${base} ${Date.now().toString(36)}`;
   }
 
   /** Игрок не может выйти за пределы зоны сектора. */
@@ -509,13 +548,28 @@ export class SectorRoom extends Room {
 
   // ────────────────────────────────────────────────── рассылка состояния ───
 
+  /**
+   * Кто попадает в «поле зрения» игрока.
+   *
+   * Простой радиус тут недостаточно: две соседние зоны могут стоять ближе
+   * AOI_RADIUS, и тогда игроки видят друг друга сквозь границу зоны — то
+   * есть сквозь стену. Поэтому зона — жёсткое условие, радиус — только
+   * второе. Видимость внутри одной зоны сквозь препятствие (колонну,
+   * дерево) этим не решается: там нужен occlusion-рейкаст на каждый тик,
+   * это отдельная задача F1.
+   */
   private visibleEntities(session: Session): EntityState[] {
     const result: EntityState[] = [];
-    for (const entity of this.entities.values()) {
-      if (entity.id === session.entityId) continue;
-      const dx = entity.x - session.x;
-      const dz = entity.z - session.z;
-      if (dx * dx + dz * dz <= AOI_RADIUS * AOI_RADIUS) result.push(entity);
+    for (const other of this.sessions.values()) {
+      if (other.entityId === session.entityId) continue;
+      if (other.zoneId !== session.zoneId) continue;
+
+      const dx = other.x - session.x;
+      const dz = other.z - session.z;
+      if (dx * dx + dz * dz > AOI_RADIUS * AOI_RADIUS) continue;
+
+      const entity = this.entities.get(other.entityId);
+      if (entity) result.push(entity);
     }
     // Собственная сущность всегда «в кадре».
     const own = this.entities.get(session.entityId);
@@ -637,18 +691,29 @@ function sanitizeName(raw: string): string {
   return cleaned.length > 0 ? cleaned : 'безымянный';
 }
 
+/** FNV-1a: быстрый детерминированный сид из строки. */
+function hashSeed(value: string): number {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash;
+}
+
 /**
  * Точка спавна со сдвигом по «золотому углу». Без него все появляются
- * в одной точке и стоят друг в друге — выглядит как один игрок.
+ * в одной точке и стоят друг в друге. Сид берётся из имени, поэтому
+ * один и тот же игрок всегда появляется в одном месте.
  */
-function spawnPoint(base: { x: number; y: number; z: number }, entityId: number): {
+function spawnPoint(base: { x: number; y: number; z: number }, seed: number): {
   x: number;
   y: number;
   z: number;
 } {
-  if (entityId <= 1) return base;
-  const angle = entityId * 2.399963;
-  const radius = SPAWN_RADIUS * Math.sqrt(1 + (entityId % 8));
+  if (seed === 0) return base;
+  const angle = seed * 2.399963;
+  const radius = SPAWN_RADIUS * Math.sqrt(1 + (seed % 8));
   return {
     x: base.x + Math.cos(angle) * radius,
     y: base.y,

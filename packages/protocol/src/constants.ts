@@ -22,11 +22,14 @@ export const AOI_SNAPSHOT_RADIUS = 32;
 /** Квантование позиции: 1/64 м (≈1.6 см). */
 export const POSITION_QUANT = 64;
 
-/** Скорости, м/с. */
+/** Скорости, м/с. 5 м/с ≈ 18 км/ч — это бег, а не прогулка. */
 export const PLAYER_SPEED = 5.0;
 export const PLAYER_SPRINT_SPEED = 8.0;
 export const PLAYER_RADIUS = 0.4;
+/** Разгон, м/с²: 0 → 5 м/с за 0.18 с. */
 export const PLAYER_ACCEL = 28.0;
+/** Торможение, м/с²: останавливаемся быстрее, чем разгоняемся. */
+export const PLAYER_DECEL = 42.0;
 
 /** Ограничения чата. */
 export const MAX_CHAT_LENGTH = 240;

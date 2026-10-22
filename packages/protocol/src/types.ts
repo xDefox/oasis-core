@@ -172,6 +172,9 @@ export interface WelcomeMsg {
   protocolVersion: string;
   /** Идентификатор сущности игрока в этом секторе. */
   playerId: number;
+  /** Имя, которое игрок получил в секторе. Может отличаться от запрошенного:
+   *  сервер добавляет суффикс при совпадении (`гость` → `гость (2)`). */
+  name: string;
   /** Идентификатор сессии Colyseus (для reconnect). */
   sessionId: string;
   world: WorldHeader;

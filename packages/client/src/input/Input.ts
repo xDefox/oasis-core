@@ -61,6 +61,11 @@ export class Input {
     }
   }
 
+  /** Вернуть управление: вызывается по клику, когда чат закрыт. */
+  requestControl(): void {
+    if (!this.pointerLocked) void this.canvas.requestPointerLock();
+  }
+
   get locked(): boolean {
     return this.pointerLocked;
   }

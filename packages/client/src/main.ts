@@ -12,7 +12,7 @@
  * он только старается угадать, чтобы не было задержки в отклике.
  */
 
-import { Group, Vector3 } from 'three/webgpu';
+import { Group, Raycaster, Vector3 } from 'three/webgpu';
 
 import {
   BIN,
@@ -42,6 +42,13 @@ import { Hud } from './ui/Hud.ts';
 const SERVER_URL =
   (import.meta.env.VITE_SERVER_URL as string | undefined) ??
   `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.hostname}:2567`;
+
+/** Камера от третьего лица: на сколько метров позади игрока. */
+const CAMERA_DISTANCE = 4.2;
+/** Ближе этого к игроку камеру не прижимаем — иначе видно изнутри капсулы. */
+const CAMERA_MIN_DISTANCE = 0.9;
+/** Высота точки, на которую смотрит камера. */
+const CAMERA_TARGET_HEIGHT = 1.4;
 
 const ACCOUNT_KEY = 'oasis.account';
 const NAME_KEY = 'oasis.name';
@@ -90,6 +97,8 @@ async function main(): Promise<void> {
   let worldPortals: PortalDef[] = [];
   let balance = 0;
   let lastReconciledTick = -1;
+  /** Ник, который выдал сервер: может отличаться от запрошенного. */
+  let selfName = '';
 
   const zoneGroups = new Map<string, Group>();
   const avatarGroups = new Map<number, Group>();
@@ -102,6 +111,7 @@ async function main(): Promise<void> {
       // Пока печатаешь — мышь не должна крутить камеру.
       if (focused) document.exitPointerLock?.();
     },
+    onRequestControl: () => input.requestControl(),
   });
 
   const input = new Input(canvas, (locked) => {
@@ -165,6 +175,16 @@ async function main(): Promise<void> {
   const handlers = {
     onWelcome(message: WelcomeMsg): void {
       hud.addChatLine(null, `добро пожаловать, ${message.world.id}@${message.world.version}`);
+      // Ник мог измениться: сервер разводит совпадения суффиксом. Молчать
+      // об этом нельзя — игрок будет искать, почему его зовут иначе.
+      selfName = message.name;
+      const requestedName = loadName();
+      if (message.name !== requestedName) {
+        hud.addChatLine(null, `ник «${requestedName}» уже занят здесь — ты ${message.name}`);
+      } else {
+        hud.addChatLine(null, `ты в мире как «${message.name}»`);
+      }
+      hud.addChatLine(null, 'WASD — идти, Shift — бежать, мышь — камера, Enter — чат');
       state.localPlayerId = message.playerId;
       zoneSummaries = message.world.zones;
       worldPortals = message.world.portals ?? [];
@@ -313,13 +333,41 @@ async function main(): Promise<void> {
   let inputAccumulator = 0;
   let pingTimer = 0;
   let ping = 0;
+  let frameCounter = 0;
 
   const cameraTarget = new Vector3();
   const cameraPosition = new Vector3();
   const lookDirection = new Vector3();
+  const rayDirection = new Vector3();
+  const rayHit = new Vector3();
+  const raycaster = new Raycaster();
+  let cameraSmoothedDistance = CAMERA_DISTANCE;
+
+  /**
+   * Максимальное расстояние от цели до камеры вдоль направления взгляда.
+   * Луч пускаем из точки взгляда: если начать из центра капсулы, рейкаст
+   * поймает саму капсулу игрока и камера встанет вплотную к лицу.
+   */
+  function clampCameraDistance(target: Vector3, desired: Vector3): number {
+    rayDirection.copy(desired).sub(target);
+    const distance = rayDirection.length();
+    if (distance < 0.001 || zoneGroups.size === 0) return distance;
+
+    rayDirection.divideScalar(distance);
+    raycaster.set(target, rayDirection);
+    raycaster.far = distance;
+
+    const hits = raycaster.intersectObjects([...zoneGroups.values()], true);
+    const hit = hits[0];
+    if (!hit) return distance;
+
+    rayHit.copy(hit.point);
+    return Math.max(CAMERA_MIN_DISTANCE, target.distanceTo(rayHit) - 0.25);
+  }
 
   function frame(): void {
     requestAnimationFrame(frame);
+    frameCounter += 1;
 
     const now = performance.now();
     const deltaMs = Math.min(now - lastFrame, 100);
@@ -332,11 +380,12 @@ async function main(): Promise<void> {
     // 2. предсказание
     localPlayer?.advance(deltaMs);
 
-    // 3. отправка ввода
+    // 3. отправка ввода. 30 Гц, но не реже раза в 500 мс: вкладка в фоне
+    // почти не рисует кадры, и без этого сервер по TTL решает, что клиент
+    // отвалился, и останавливает игрока.
     if (localPlayer && connection.connected) {
-      inputAccumulator += deltaMs;
-      const interval = 1000 / INPUT_RATE;
-      if (inputAccumulator >= interval) {
+      inputAccumulator = Math.min(inputAccumulator + deltaMs, 400);
+      if (inputAccumulator >= 1000 / INPUT_RATE) {
         inputAccumulator = 0;
         connection.sendInput({
           seq: localPlayer.nextSeq(),
@@ -348,24 +397,32 @@ async function main(): Promise<void> {
       }
     }
 
-    // 4. интерполяция и отрисовка
+    // 5. интерполяция и отрисовка
     const renderTime = now - INTERP_DELAY_MS;
     const snapshot = state.sampleAt(renderTime);
 
     for (const [id, group] of avatarGroups) {
       if (id === state.localPlayerId) continue;
       const entity = snapshot.get(id);
-      if (!entity) continue;
+      if (!entity) {
+        // Игрок ушёл из зоны или за радиус видимости: сервер перестал
+        // слать его состояние. Тело не должно зависнуть на месте — прячем.
+        group.visible = false;
+        continue;
+      }
+      group.visible = true;
       group.position.set(entity.x, entity.y, entity.z);
       group.rotation.y = entity.yaw;
     }
 
     // Свой аватар — по предсказанию, а не по интерполированному снимку:
     // снимок отстаёт на INTERP_DELAY_MS, и камера уезжала бы от тела.
+    // renderX/renderZ добавляют дробный шаг внутри тика — иначе тело
+    // дёргалось бы 20 раз в секунду при плавной камере.
     if (localPlayer) {
       const own = avatarGroups.get(state.localPlayerId);
       if (own) {
-        own.position.set(localPlayer.x, 0, localPlayer.z);
+        own.position.set(localPlayer.renderX, 0, localPlayer.renderZ);
         own.rotation.y = input.yaw;
       }
     }
@@ -380,10 +437,25 @@ async function main(): Promise<void> {
         Math.sin(pitch),
         -Math.cos(yaw) * Math.cos(pitch),
       );
-      cameraTarget.set(localPlayer.x, 1.4, localPlayer.z);
-      cameraPosition.copy(cameraTarget).addScaledVector(lookDirection, -4.2);
-      const smoothing = 1 - Math.exp(-deltaMs / 60);
-      camera.position.lerp(cameraPosition, smoothing);
+      cameraTarget.set(localPlayer.renderX, CAMERA_TARGET_HEIGHT, localPlayer.renderZ);
+      cameraPosition.copy(cameraTarget).addScaledVector(lookDirection, -CAMERA_DISTANCE);
+
+      // Прижимаем камеру к стене: если между ней и игроком что-то есть,
+      // ставим её ближе, иначе она смотрит из-за стены на пустой мир.
+      const clamped = clampCameraDistance(cameraTarget, cameraPosition);
+      if (clamped < CAMERA_DISTANCE - 0.01) {
+        // Вылезли из стены — принимаем новое расстояние мгновенно,
+        // иначе камера проезжает сквозь препятствие.
+        const direction = cameraPosition.clone().sub(cameraTarget).normalize();
+        camera.position.copy(cameraTarget).addScaledVector(direction, clamped);
+        cameraSmoothedDistance = clamped;
+      } else {
+        // Обратно отъезжаем плавно, иначе камера дёргается на каждом углу.
+        cameraSmoothedDistance += (clamped - cameraSmoothedDistance) * (1 - Math.exp(-deltaMs / 90));
+        const direction = cameraPosition.clone().sub(cameraTarget).normalize();
+        camera.position.copy(cameraTarget).addScaledVector(direction, cameraSmoothedDistance);
+      }
+
       camera.lookAt(cameraTarget);
     }
 
@@ -409,6 +481,55 @@ async function main(): Promise<void> {
   window.addEventListener('beforeunload', () => {
     connection.leave();
   });
+
+  // Отладочный доступ для зонда (scripts/probe-client.mjs). Не API:
+  // существует только чтобы можно было проверить предсказание снаружи.
+  (window as unknown as { __oasisDebug?: () => unknown }).__oasisDebug = () => ({
+    x: Number(localPlayer?.x.toFixed(3) ?? 0),
+    z: Number(localPlayer?.z.toFixed(3) ?? 0),
+    renderX: Number(localPlayer?.renderX.toFixed(3) ?? 0),
+    renderZ: Number(localPlayer?.renderZ.toFixed(3) ?? 0),
+    vx: Number(localPlayer?.vx.toFixed(3) ?? 0),
+    vz: Number(localPlayer?.vz.toFixed(3) ?? 0),
+    yaw: Number(input.yaw.toFixed(3)),
+    cameraDistance: Number(camera.position.distanceTo(cameraTarget).toFixed(3)),
+    zoneGroups: zoneGroups.size,
+    avatars: avatarGroups.size,
+    roster: state.roster.size,
+    /** Сколько чужих тел реально отрисовано (не спрятано) в данный момент. */
+    visibleOthers: [...avatarGroups.entries()].filter(
+      ([id, group]) => id !== state.localPlayerId && group.visible,
+    ).length,
+    /** Сколько чужих тел есть в снимке состояния. */
+    trackedOthers: [...avatarGroups.keys()].filter((id) => id !== state.localPlayerId).length,
+    rosterPlayers: [...state.roster.values()].map((player) => ({
+      id: player.id,
+      name: player.name,
+    })),
+    selfName: selfName,
+    lastTick: state.lastTick,
+    keys: [...input.keys],
+    frames: frameCounter,
+  });
+
+  (window as unknown as { __oasisWarp?: (x: number, z: number) => void }).__oasisWarp = (
+    x,
+    z,
+  ) => {
+    localPlayer?.teleportTo(x, z);
+  };
+
+  // Зонду нужно сверять предсказание с сервером, не читая поля класса.
+  (window as unknown as { __oasisCompare?: () => unknown }).__oasisCompare = () => {
+    const server = state.latest(state.localPlayerId);
+    return {
+      clientX: localPlayer ? Number(localPlayer.x.toFixed(3)) : null,
+      clientZ: localPlayer ? Number(localPlayer.z.toFixed(3)) : null,
+      serverX: server ? Number(server.x.toFixed(3)) : null,
+      serverZ: server ? Number(server.z.toFixed(3)) : null,
+      frames: frameCounter,
+    };
+  };
 
   frame();
 }

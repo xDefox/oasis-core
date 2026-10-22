@@ -13,3 +13,4 @@ export * from './constants.ts';
 export * from './domain.ts';
 export * from './types.ts';
 export * from './codec.ts';
+export * from './movement.ts';

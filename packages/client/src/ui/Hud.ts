@@ -8,6 +8,8 @@
 export interface HudCallbacks {
   onChat(text: string): void;
   onChatFocusChange(focused: boolean): void;
+  /** Игрок кликнул по странице, когда чат не открыт — вернуть управление. */
+  onRequestControl(): void;
 }
 
 export class Hud {
@@ -48,6 +50,16 @@ export class Hud {
     });
 
     this.chatInput.addEventListener('blur', () => this.setChatFocused(false));
+
+    // Ссылки не должны уводить со страницы: единственная навигация здесь —
+    // «кликни, чтобы вернуть управление».
+    document.addEventListener('click', (event) => {
+      const target = event.target as HTMLElement | null;
+      if (target?.closest('a')) event.preventDefault();
+      if (this.chatFocused) return;
+      if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) return;
+      this.callbacks.onRequestControl();
+    });
   }
 
   setStatus(kind: 'connecting' | 'open' | 'closed' | 'error', detail?: string): void {

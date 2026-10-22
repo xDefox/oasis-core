@@ -16,6 +16,7 @@ import { WebSocketTransport } from '@colyseus/ws-transport';
 import { Client } from '@colyseus/sdk';
 
 import {
+  AOI_RADIUS,
   BIN_CHANNEL,
   PROTOCOL_VERSION,
   decodeDelta,
@@ -79,8 +80,9 @@ function recorder(room: {
 async function joinWorld(
   client: Client,
   hello: { accountId: string; accountCreatedAt: number; name: string },
+  roomName = 'sector',
 ): Promise<{ room: Awaited<ReturnType<Client['joinOrCreate']>>; record: Recorder }> {
-  const room = await client.joinOrCreate('sector', {
+  const room = await client.joinOrCreate(roomName, {
     protocolVersion: PROTOCOL_VERSION,
     ...hello,
   });
@@ -108,6 +110,8 @@ describe('вертикальный срез: два игрока видят др
   let world: Awaited<ReturnType<typeof loadWorld>>;
   /** Мир для теста порталов: спавн стоит прямо в портале, зоны — те же. */
   let portalWorld: Awaited<ReturnType<typeof loadWorld>>;
+  /** Мир для теста видимости: спавн вне портала, но зоны граничат близко. */
+  let aoiWorld: Awaited<ReturnType<typeof loadWorld>>;
 
   before(async () => {
     world = await loadWorld(config.worldPath);
@@ -118,6 +122,34 @@ describe('вертикальный срез: два игрока видят др
       { id: 'p_test_in', fromZone: 'z_plaza', toZone: 'z_grove', x: 2, z: 0, radius: 3 },
       { id: 'p_test_out', fromZone: 'z_grove', toZone: 'z_plaza', x: 92, z: 0, radius: 3 },
     ];
+
+    // Две зоны, стоящие впритык: игроки из разных зон попадают в один
+    // AOI_RADIUS. Именно так ловится «видно сквозь границу зоны».
+    // Левая x∈[-10,10], правая x∈[10,30] — на x=9 и x=11 они в 2 м
+    // друг от друга, но в разных зонах.
+    aoiWorld = structuredClone(world);
+    aoiWorld.zones = [
+      {
+        ...aoiWorld.zones[0]!,
+        id: 'z_left',
+        name: 'left',
+        bounds: { x: 0, z: 0, w: 20, d: 20 },
+      },
+      {
+        ...aoiWorld.zones[0]!,
+        id: 'z_right',
+        name: 'right',
+        bounds: { x: 15, z: 0, w: 10, d: 20 },
+      },
+    ];
+    aoiWorld.portals = [
+      { id: 'p_aoi', fromZone: 'z_left', toZone: 'z_right', x: 9, z: 0, radius: 1.5 },
+      { id: 'p_aoi_back', fromZone: 'z_right', toZone: 'z_left', x: 11, z: 0, radius: 1.5 },
+    ];
+    // Левая зона x∈[-10,10], правая x∈[10,20]. Игрок из правой не может
+    // уехать дальше x=20, то есть дальше AOI_RADIUS от спавна альфы:
+    // «ушёл далеко» исключено, и тест проверяет ровно правило зоны.
+    aoiWorld.sectors[0]!.spawn = { x: 0, y: 0, z: 0 };
 
     const ledger = new MemoryLedger();
     const httpServer = http.createServer();
@@ -130,6 +162,7 @@ describe('вертикальный срез: два игрока видят др
       ledger,
       maxPlayers: 16,
     });
+    gameServer.define('sector_aoi', SectorRoom, { world: aoiWorld, ledger, maxPlayers: 16 });
     await gameServer.listen(PORT);
   });
 
@@ -163,6 +196,63 @@ describe('вертикальный срез: два игрока видят др
     assert.equal(roster.players[0]!.name, 'alpha');
 
     await room.leave();
+  });
+
+  it('разводит игроков с одинаковым ником суффиксом', async () => {
+    // Сценарий из жизни: две вкладки одного браузера делят localStorage и
+    // присылают один и тот же guest-ник. Игрок опознаёт других только по
+    // имени, поэтому дубль — баг, а не косметика.
+    const first = new Client(`ws://localhost:${PORT}`);
+    const second = new Client(`ws://localhost:${PORT}`);
+    const third = new Client(`ws://localhost:${PORT}`);
+
+    const { room: firstRoom, record: firstRecord } = await joinWorld(first, {
+      accountId: 'acct_dup_000000000001',
+      accountCreatedAt: Date.now() - 5 * 24 * 60 * 60 * 1000,
+      name: 'guest-1234',
+    });
+    await waitFor(() => firstRecord.welcome, 8000, 'welcome первого');
+
+    const { room: secondRoom, record: secondRecord } = await joinWorld(second, {
+      accountId: 'acct_dup_000000000002',
+      accountCreatedAt: Date.now() - 5 * 24 * 60 * 60 * 1000,
+      name: 'guest-1234',
+    });
+    await waitFor(() => secondRecord.welcome, 8000, 'welcome второго');
+
+    const { room: thirdRoom, record: thirdRecord } = await joinWorld(third, {
+      accountId: 'acct_dup_000000000003',
+      accountCreatedAt: Date.now() - 5 * 24 * 60 * 60 * 1000,
+      name: 'guest-1234',
+    });
+    await waitFor(() => thirdRecord.welcome, 8000, 'welcome третьего');
+
+    const names = [
+      firstRecord.welcome!.name,
+      secondRecord.welcome!.name,
+      thirdRecord.welcome!.name,
+    ];
+    assert.deepEqual(
+      names,
+      ['guest-1234', 'guest-1234 (2)', 'guest-1234 (3)'],
+      'имена должны быть уникальны, начиная со второго — с суффиксом',
+    );
+
+    // Ростер тоже без дублей — именно его видят игроки.
+    const roster = await waitFor(
+      () => {
+        const current = firstRecord.roster;
+        return current && current.players.length === 3 ? current : undefined;
+      },
+      8000,
+      'ростер из трёх',
+    );
+    const rosterNames = roster.players.map((player) => player.name).sort();
+    assert.deepEqual(rosterNames, ['guest-1234', 'guest-1234 (2)', 'guest-1234 (3)']);
+
+    await firstRoom.leave();
+    await secondRoom.leave();
+    await thirdRoom.leave();
   });
 
   it('показывает второго игрока и двигает его по дельтам', async () => {
@@ -295,6 +385,87 @@ describe('вертикальный срез: два игрока видят др
     assert.equal(record.teleports.length, 1, 'игрока унесло обратно');
 
     await room.leave();
+  });
+
+  it('не показывает игрока из другой зоны, даже если он рядом', async () => {
+    // Регрессия: AOI считался только по расстоянию, поэтому игроки из
+    // соседних зон видели друг друга сквозь границу зоны — то есть сквозь
+    // стену. Зона должна быть жёстким условием.
+    const alpha = new Client(`ws://localhost:${PORT}`);
+    const beta = new Client(`ws://localhost:${PORT}`);
+
+    const { room: alphaRoom, record: alphaRecord } = await joinWorld(
+      alpha,
+      {
+        accountId: 'acct_aoi_000000000001',
+        accountCreatedAt: Date.now() - 5 * 24 * 60 * 60 * 1000,
+        name: 'aoi-alpha',
+      },
+      'sector_aoi',
+    );
+    // Ростер у обоих — двое: игрок из другой зоны остаётся в реестре
+    // (он в мире), но его состояние больше не шлётся.
+    const { room: betaRoom, record: betaRecord } = await joinWorld(
+      beta,
+      {
+        accountId: 'acct_aoi_000000000002',
+        accountCreatedAt: Date.now() - 5 * 24 * 60 * 60 * 1000,
+        name: 'aoi-beta',
+      },
+      'sector_aoi',
+    );
+
+    await waitFor(() => alphaRecord.welcome, 8000, 'welcome alpha');
+
+    // Бета идёт вправо до портала и уходит в z_right. Ввод надо слать
+    // постоянно: у сервера есть TTL ввода, и «одно нажатие на 8 секунд»
+    // он справедливо трактует как «клиент отвалился».
+    let pump = true;
+    const pumping = (async () => {
+      let seq = 0;
+      while (pump) {
+        seq += 1;
+        betaRoom.sendBytes(
+          BIN_CHANNEL,
+          encodeInput({ seq, dirX: 1, dirZ: 0, yaw: 0, sprint: true }),
+        );
+        await new Promise((resolve) => setTimeout(resolve, 40));
+      }
+    })();
+
+    const teleport = await waitFor(() => betaRecord.teleports[0], 8000, 'телепорт беты');
+    pump = false;
+    await pumping;
+    assert.equal(teleport.zoneId, 'z_right');
+
+    // Ключевое: бета остаётся В РАДИУСЕ видимости альфы. Если бы AOI считался
+    // только по расстоянию, бета была бы видна. Значит `removed` ниже
+    // доказывает именно правило зоны, а не «ушёл далеко».
+    const alphaSpawn = (await waitFor(() => alphaRecord.welcome, 8000, 'welcome α')).spawn;
+    const betaPlayerId = (await waitFor(() => betaRecord.welcome, 8000, 'welcome β')).playerId;
+    const distance = Math.hypot(
+      teleport.position.x - alphaSpawn.x,
+      teleport.position.z - alphaSpawn.z,
+    );
+    assert.ok(
+      distance < AOI_RADIUS,
+      `бета должна быть в радиусе AOI, а не в ${distance.toFixed(1)} м`,
+    );
+
+    // После ухода беты в другую зону альфа должна получить removed.
+    const removed = await waitFor(
+      () => alphaRecord.deltas.find((delta) => delta.removed.length > 0),
+      8000,
+      'removed после ухода беты в другую зону',
+    );
+    assert.deepEqual(
+      removed.removed,
+      [betaPlayerId],
+      'из поля зрения должна пропасть именно бета',
+    );
+
+    await alphaRoom.leave();
+    await betaRoom.leave();
   });
 
   it('отказывает клиенту с чужой версией протокола', async () => {
