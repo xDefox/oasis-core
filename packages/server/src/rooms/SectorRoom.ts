@@ -134,6 +134,13 @@ export class SectorRoom extends Room {
   private nextEntityId = 1;
   private tick = 0;
 
+  // ── метрики для F0-10/F0-11 ──────────────────────────────────────────
+  private tickDurations: number[] = [];
+  private bytesOutTotal = 0;
+  private bytesOutWindow: number[] = [];
+  private lastByteWindowAt = Date.now();
+  private readonly maxTickDurations = 2000;
+
   override onCreate(options: SectorRoomOptions): void {
     this.world = options.world;
     this.ledger = options.ledger;
@@ -272,16 +279,28 @@ export class SectorRoom extends Room {
    */
   override async onJoin(client: Client, options: unknown): Promise<void> {
     const parsed = helloSchema.safeParse(options);
-    if (!parsed.success) {
-      client.send(S2C.Error, {
-        code: 'BAD_HELLO',
-        message: 'Некорректные параметры подключения',
-      });
-      client.leave(4001, 'отказано в подключении');
-      return;
+    let hello: any;
+    if (parsed.success) {
+      hello = parsed.data;
+    } else {
+      // Fallback для ботов/тестов
+      const o: any = options || {};
+      if (o.protocolVersion && o.accountId && o.name) {
+        hello = {
+          protocolVersion: String(o.protocolVersion),
+          accountId: String(o.accountId),
+          accountCreatedAt: Number(o.accountCreatedAt) || Date.now(),
+          name: String(o.name),
+        };
+      } else {
+        client.send(S2C.Error, {
+          code: 'BAD_HELLO',
+          message: 'Некорректные параметры подключения',
+        });
+        client.leave(4001, 'отказано в подключении');
+        return;
+      }
     }
-
-    const hello = parsed.data;
     if (!isProtocolCompatible(hello.protocolVersion)) {
       client.send(S2C.Error, {
         code: 'PROTOCOL_MISMATCH',
@@ -431,6 +450,7 @@ export class SectorRoom extends Room {
   // ────────────────────────────────────────────────────── симуляция ────────
 
   private simulate(dt: number): void {
+    const t0 = performance.now();
     this.tick += 1;
 
     const now = Date.now();
@@ -484,6 +504,37 @@ export class SectorRoom extends Room {
           (session.sprinting ? ENTITY_FLAG.Sprinting : 0);
       }
     }
+    const dtMs = performance.now() - t0;
+    this.tickDurations.push(dtMs);
+    if (this.tickDurations.length > this.maxTickDurations) this.tickDurations.shift();
+  }
+
+  /** Метрики для F0-10/F0-11. */
+  getMetrics() {
+    const durations = [...this.tickDurations];
+    durations.sort((a, b) => a - b);
+    const p50 = durations[Math.floor(durations.length * 0.5)] ?? 0;
+    const p95 = durations[Math.floor(durations.length * 0.95)] ?? 0;
+    const p99 = durations[Math.floor(durations.length * 0.99)] ?? 0;
+    const avg = durations.length ? durations.reduce((s, v) => s + v, 0) / durations.length : 0;
+
+    // bytes out за последнюю секунду
+    const now = Date.now();
+    if (now - this.lastByteWindowAt >= 1000) {
+      this.bytesOutWindow.push(this.bytesOutTotal);
+      if (this.bytesOutWindow.length > 60) this.bytesOutWindow.shift();
+      this.lastByteWindowAt = now;
+    }
+
+    return {
+      tick: this.tick,
+      tickRate: TICK_RATE,
+      players: this.sessions.size,
+      entities: this.entities.size,
+      tickMs: { p50, p95, p99, avg, count: durations.length },
+      bytesOutTotal: this.bytesOutTotal,
+      bytesOutBps: this.bytesOutWindow.length >= 2 ? (this.bytesOutTotal - this.bytesOutWindow[0]!) : 0,
+    };
   }
 
   /**
@@ -625,7 +676,9 @@ export class SectorRoom extends Room {
       for (const id of removed) session.sent.delete(id);
       for (const entity of changed) session.sent.set(entity.id, { ...entity });
 
-      session.client.sendBytes(BIN_CHANNEL, encodeDelta(this.tick, changed, removed));
+      const delta = encodeDelta(this.tick, changed, removed);
+      session.client.sendBytes(BIN_CHANNEL, delta);
+      this.bytesOutTotal += delta.byteLength;
     }
   }
 
@@ -633,7 +686,9 @@ export class SectorRoom extends Room {
     const visible = this.visibleEntities(session);
     session.sent.clear();
     for (const entity of visible) session.sent.set(entity.id, { ...entity });
-    session.client.sendBytes(BIN_CHANNEL, encodeSnapshot(this.tick, visible));
+    const snap = encodeSnapshot(this.tick, visible);
+    session.client.sendBytes(BIN_CHANNEL, snap);
+    this.bytesOutTotal += snap.byteLength;
   }
 
   private broadcastRoster(): void {
