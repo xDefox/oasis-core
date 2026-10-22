@@ -37,12 +37,12 @@ if (before.visibleOthers !== 1) {
 await walker.bringToFront();
 await delay(400);
 
+const startZone = (await debug(walker)).zone?.id ?? null;
 let reachedPortal = false;
 for (let step = 0; step < 60; step += 1) {
   const state = await debug(walker);
-  // Признак надёжнее координат: клиент догрузил вторую зону, то есть зона
-  // реально сменилась. Координатный порог проскакивается между опросами.
-  if (state.zoneGroups >= 2) {
+  // После F0-9 зона одна: признак перехода — смена zone.id, а не zoneGroups≥2.
+  if (startZone && state.zone?.id && state.zone.id !== startZone) {
     reachedPortal = true;
     break;
   }
@@ -85,7 +85,7 @@ if (after.roster !== 2) {
   problems.add(`ростер должен остаться из двух (он ещё в мире): ${after.roster}`);
 }
 
-await watcher.screenshot({ path: '/tmp/oasis-zone-exit.png' });
+await watcher.screenshot({ path: '/tmp/oasis-zone-exit.png' }).catch(() => {});
 
 await browser.close();
 problems.finish();
