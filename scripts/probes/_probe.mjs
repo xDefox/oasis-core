@@ -120,6 +120,49 @@ export async function newPlayer(browser, name, problems, { accountAgeDays = 30 }
 export const debug = (page) => page.evaluate(() => window.__oasisDebug());
 
 /**
+ * Ждёт, пока клиент отработает N тиков, и возвращает, сколько тиков прошло.
+ *
+ * Нужно вместо `delay(...)`: клиент двигает игрока в `requestAnimationFrame`,
+ * поэтому за 1200 мс стенки на 3 fps он отработает 7 тиков вместо 24. Зонд,
+ * который меряет путь по часам, на такой машине видит не движение, а скорость
+ * машины, на которой он запущен, и падает на живом коде (в CI так и было:
+ * «второй игрок не двигается» на зелёном коде).
+ */
+export async function waitForTicks(page, ticks = 10, timeoutMs = 60_000) {
+  const deadline = Date.now() + timeoutMs;
+  const start = (await debug(page)).simTicks ?? 0;
+  let elapsed = 0;
+  while (Date.now() < deadline) {
+    elapsed = ((await debug(page)).simTicks ?? 0) - start;
+    if (elapsed >= ticks) return elapsed;
+    await delay(100);
+  }
+  return elapsed;
+}
+
+/**
+ * Держит клавишу, пока игрок не упрётся в стену (скорость стала нулевой),
+ * и возвращает число отработанных тиков.
+ *
+ * Ждём по тикам, а не по часам: за 8 секунд стенки на 3 fps клиент отработает
+ * 2.4 с симуляции, и до дальней стены игрок просто не доедет.
+ */
+export async function holdUntilStopped(page, key, { maxTicks = 240 } = {}) {
+  await page.keyboard.down(key);
+  const start = (await debug(page)).simTicks ?? 0;
+  let ticks = 0;
+  while (ticks < maxTicks) {
+    await delay(100);
+    const state = await debug(page);
+    ticks = (state.simTicks ?? 0) - start;
+    // Первые тики — разгон: скорость ещё нулевая, но игрок уже едет.
+    if (ticks > 5 && Math.hypot(state.vx, state.vz) < 0.01) break;
+  }
+  await page.keyboard.up(key);
+  return ticks;
+}
+
+/**
  * Начинает сбор профиля скорости и ждёт первый образец.
  *
  * Ждать первый образец обязательно: без него первое же изменение скорости

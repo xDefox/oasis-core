@@ -13,6 +13,7 @@ import {
   chat,
   debug,
   delay,
+  holdUntilStopped,
   launch,
   newPlayer,
   Problems,
@@ -20,6 +21,7 @@ import {
   stopSampling,
   unexplainedSpeedDrop,
   unexplainedSpeedGrowth,
+  waitForTicks,
 } from './_probe.mjs';
 
 const problems = new Problems();
@@ -51,15 +53,22 @@ if (roster.visibleOthers < 1) {
 //
 // Сбор стартует ДО нажатия: нужен образец в покое, иначе скачок 0 → 5 не с
 // чем сравнить (на этом проверка уже обманулась один раз).
+//
+// Длительность держим в ТИКАХ, а не в миллисекундах: клиент тикает в
+// requestAnimationFrame, и на 3 fps за 1200 мс стенки он отработает 7 тиков
+// вместо 24. Проверка по часам меряет не движение, а скорость машины, на
+// которой запущен CI, и падает на живом коде.
+const WALK_TICKS = 30; // 1.5 с симуляции
+const STOP_TICKS = 18; // 0.9 с симуляции на торможение
 await alpha.bringToFront();
-await delay(600);
+await waitForTicks(alpha, 5);
 const before = await debug(alpha);
 await startSampling(alpha);
 await alpha.keyboard.down('KeyW');
-await delay(1200);
+const walked = await waitForTicks(alpha, WALK_TICKS);
 const during = await debug(alpha);
 await alpha.keyboard.up('KeyW');
-await delay(900);
+await waitForTicks(alpha, STOP_TICKS);
 const samples = await stopSampling(alpha);
 const stopped = await debug(alpha);
 
@@ -72,9 +81,9 @@ console.log(
 );
 console.log('профиль скорости:', samples.map((s) => s.speed).join(' → '));
 
-// Тик — 50 мс, значит 5 тиков это 0.25 с: на них разгон до 5 м/с уже виден.
-if (ticks < 5) {
-  problems.add(`слишком мало тиков предсказания для проверки: ${ticks} (нужно ≥ 5)`);
+// Тик — 50 мс. 30 тиков = 1.5 с: за это время игрок обязан доехать.
+if (walked < WALK_TICKS) {
+  problems.add(`мало тиков предсказания для проверки: ${walked} (нужно ≥ ${WALK_TICKS})`);
 }
 if (travelled < 1) problems.add(`игрок не сдвинулся: ${travelled.toFixed(2)} м`);
 // 1.5 с на максимальных 8 м/с — это 12 м; больше означало бы телепорт.
@@ -106,14 +115,15 @@ console.log(`экстраполяция рендера: ${ahead.toFixed(3)} м �
 // зоны»: первая версия теста называла нормальный уход в соседнюю зону
 // «выходом за границу» — тест врал, а продукт был прав.
 await alpha.bringToFront();
-await delay(600);
+await waitForTicks(alpha, 5);
 const atWallStart = await debug(alpha);
 
-// Отходим по z: yaw = 0, значит S = +Z.
+// Отходим по z: yaw = 0, значит S = +Z. 30 тиков = 1.5 с симуляции ≈ 7 м:
+// хватает, чтобы уйти от портала, и не зависит от fps.
 await alpha.keyboard.down('KeyS');
-await delay(2500);
+await waitForTicks(alpha, 30);
 await alpha.keyboard.up('KeyS');
-await delay(600);
+await waitForTicks(alpha, 5);
 const aside = await debug(alpha);
 console.log('отошли от портала:', { x: aside.x, z: aside.z, зона: aside.zone?.id });
 
@@ -121,10 +131,12 @@ if (Math.abs(aside.z) < 5) {
   problems.add(`не удалось отойти от портала по z: z=${aside.z} (нужно |z| > 5)`);
 }
 
-await alpha.keyboard.down('KeyD');
-await delay(8000);
+// Идём вправо до упора. Ждём упрётся, а не «прошло 8 секунд»: на 3 fps за
+// 8 с стенки клиент отработает 2.4 с симуляции и до дальней стены просто не
+// доедет — зонд скажет «не дошёл» про живой код.
+const wallTicks = await holdUntilStopped(alpha, 'KeyD');
 const pressed = await debug(alpha);
-await alpha.keyboard.up('KeyD');
+console.log(`упёрся в стену за ${wallTicks} тиков`);
 console.log('у стены:', {
   старт: { x: atWallStart.x, z: atWallStart.z },
   финиш: { x: pressed.x, z: pressed.z },
@@ -153,6 +165,10 @@ if (!pressed.zone) {
   if (pressed.zone.id === 'z_plaza' && pressed.x < wallX - 0.7) {
     problems.add(`игрок не дошёл до стены: x=${pressed.x} (ждём ~${wallX})`);
   }
+  // Если вправо не поехали вообще — это не «не дошёл», это ввод не дошёл.
+  if (pressed.x - aside.x < 1) {
+    problems.add(`вправо не поехали: x ${aside.x} → ${pressed.x} — ввод не дошёл до клиента`);
+  }
 }
 
 // ── камера ──────────────────────────────────────────────────────────────
@@ -176,18 +192,26 @@ if (!betaChat.some((line) => line.includes('проверка связи'))) {
 }
 
 // ── второй игрок двигается у себя и это видно первому ───────────────────
+// Вкладка beta до этого была в фоне, а в headless фоновой вкладке Chromium
+// не даёт кадров: requestAnimationFrame молчит, и клиент не тикает вообще.
+// Поэтому меряем по тикам, а не по часам — иначе зонд меряет скорость
+// машины, на которой он запущен, и падает на живом коде («второй игрок не
+// двигается» в CI — именно это).
 await beta.bringToFront();
-await delay(600);
+await waitForTicks(beta, 5);
 const betaBefore = await debug(beta);
 await beta.keyboard.down('KeyW');
-await delay(1200);
+const betaWalked = await waitForTicks(beta, WALK_TICKS);
 const betaMoved = await debug(beta);
 await beta.keyboard.up('KeyW');
 const betaTravelled = Math.hypot(betaMoved.x - betaBefore.x, betaMoved.z - betaBefore.z);
-console.log(`движение beta: ${betaTravelled.toFixed(2)} м`);
+console.log(`движение beta: ${betaTravelled.toFixed(2)} м за ${betaWalked} тиков`);
+if (betaWalked < WALK_TICKS) {
+  problems.add(`beta отработал мало тиков: ${betaWalked} (нужно ≥ ${WALK_TICKS})`);
+}
 if (betaTravelled < 2) problems.add('второй игрок не двигается');
 
-await delay(1200);
+await waitForTicks(beta, STOP_TICKS);
 const betaStopped = await debug(beta);
 if (Math.abs(betaStopped.vx) > 0.001 || Math.abs(betaStopped.vz) > 0.001) {
   problems.add(`второй игрок не остановился: vx=${betaStopped.vx} vz=${betaStopped.vz}`);
