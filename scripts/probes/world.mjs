@@ -13,11 +13,13 @@ import {
   chat,
   debug,
   delay,
-  hasIntermediateSpeed,
   launch,
   newPlayer,
   Problems,
-  sampleVelocity,
+  startSampling,
+  stopSampling,
+  unexplainedSpeedDrop,
+  unexplainedSpeedGrowth,
 } from './_probe.mjs';
 
 const problems = new Problems();
@@ -42,50 +44,51 @@ if (roster.visibleOthers < 1) {
 }
 
 // ── движение своим ходом ────────────────────────────────────────────────
-// Headless swiftshader даёт 10–15 fps, а предсказание идёт по реальному
-// времени. Поэтому проверяем не «сколько прошёл», а профиль скорости:
-// разгон должен быть ПЛАВНЫМ, а остановка — полной.
+// Headless swiftshader даёт 3–15 fps, а предсказание идёт фиксированным шагом
+// 50 мс. Поэтому меряем не кадры и не время, а тики: «сколько прошло» берём
+// из simTicks, «как быстро можно менять скорость» — из тех же чисел, что у
+// сервера (28 м/с² разгон, 42 м/с² торможение).
+//
+// Сбор стартует ДО нажатия: нужен образец в покое, иначе скачок 0 → 5 не с
+// чем сравнить (на этом проверка уже обманулась один раз).
 await alpha.bringToFront();
 await delay(600);
 const before = await debug(alpha);
+await startSampling(alpha);
 await alpha.keyboard.down('KeyW');
-const accel = await sampleVelocity(alpha, 1200);
+await delay(1200);
 const during = await debug(alpha);
 await alpha.keyboard.up('KeyW');
-const brake = await sampleVelocity(alpha, 900);
+await delay(900);
+const samples = await stopSampling(alpha);
 const stopped = await debug(alpha);
 
 const travelled = Math.hypot(during.x - before.x, during.z - before.z);
 const speed = Math.hypot(during.vx, during.vz);
+const ticks = during.simTicks - before.simTicks;
 console.log(
   `движение: ${travelled.toFixed(2)} м, скорость ${speed.toFixed(2)} м/с, ` +
-    `кадров ${during.frames - before.frames}`,
+    `тиков ${ticks}, образцов ${samples.length}`,
 );
-console.log('профиль разгона:', accel.map((s) => s.speed).join(' → '));
-console.log('профиль торможения:', brake.map((s) => s.speed).join(' → '));
+console.log('профиль скорости:', samples.map((s) => s.speed).join(' → '));
 
-if (during.frames - before.frames < 5) {
-  problems.add(`слишком мало кадров для проверки: ${during.frames - before.frames}`);
+// Тик — 50 мс, значит 5 тиков это 0.25 с: на них разгон до 5 м/с уже виден.
+if (ticks < 5) {
+  problems.add(`слишком мало тиков предсказания для проверки: ${ticks} (нужно ≥ 5)`);
 }
 if (travelled < 1) problems.add(`игрок не сдвинулся: ${travelled.toFixed(2)} м`);
 // 1.5 с на максимальных 8 м/с — это 12 м; больше означало бы телепорт.
 if (travelled > 12.5) problems.add(`игрок быстрее скорости: ${travelled.toFixed(2)} м за 1.5 с`);
 if (speed < 4.5) problems.add(`скорость не вышла на целевую — разгон сломан: ${speed.toFixed(2)}`);
 
-// Разгон плавный: скорость проходит через промежуточные значения.
-// Мгновенный прыжок 0 → 5 — это «скольжение по льду», баг плейтеста 22.10.
-if (!hasIntermediateSpeed(accel)) {
-  problems.add(
-    `разгон не плавный: скорость прыгнула к цели мимо промежуточных значений ` +
-      `(${accel.map((s) => s.speed).join(', ')})`,
-  );
+// Разгон плавный: скорость не может прыгнуть к цели за один тик.
+// «Скольжение по льду» из плейтеста 22.10 — это ровно такой прыжок.
+for (const growth of unexplainedSpeedGrowth(samples)) {
+  problems.add(`разгон быстрее физики: ${growth}`);
 }
-// Торможение тоже плавное: скорость не должна обнулиться одним кадром.
-if (!hasIntermediateSpeed(brake)) {
-  problems.add(
-    `торможение не плавное: скорость обнулилась скачком ` +
-      `(${brake.map((s) => s.speed).join(', ')})`,
-  );
+// Торможение тоже плавное: скорость не может обнулиться скачком.
+for (const drop of unexplainedSpeedDrop(samples)) {
+  problems.add(`торможение быстрее физики: ${drop}`);
 }
 if (Math.abs(stopped.vx) > 0.001 || Math.abs(stopped.vz) > 0.001) {
   problems.add(`скорость не обнулилась: vx=${stopped.vx} vz=${stopped.vz}`);

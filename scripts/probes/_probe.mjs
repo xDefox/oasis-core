@@ -120,41 +120,100 @@ export async function newPlayer(browser, name, problems, { accountAgeDays = 30 }
 export const debug = (page) => page.evaluate(() => window.__oasisDebug());
 
 /**
- * Профиль скорости по кадрам.
+ * Начинает сбор профиля скорости и ждёт первый образец.
  *
- * Нужен, чтобы отличить «плавный разгон» от «прыжка на целевую скорость».
- * Если просто спросить скорость через полторы секунды, оба варианта дадут
- * 5 м/с, и сломанный разгон не будет виден вообще.
- *
- * Собираем прямо в странице по requestAnimationFrame: опрос из Node
- * пропускал бы кадры, а headless рисует всего 10–15 fps.
+ * Ждать первый образец обязательно: без него первое же изменение скорости
+ * не с чем сравнить, и скачок 0 → 5 проходит незамеченным. Сбор идёт в
+ * странице по requestAnimationFrame и живёт до `stopSampling` — так образец
+ * «в покое» попадает в выборку до нажатия клавиши.
  */
-export const sampleVelocity = (page, ms) =>
-  page.evaluate(async (duration) => {
+export async function startSampling(page) {
+  await page.evaluate(() => {
     const samples = [];
-    const started = performance.now();
-    while (performance.now() - started < duration) {
-      await new Promise((resolve) => requestAnimationFrame(resolve));
+    window.__oasisSamples = samples;
+    window.__oasisSampling = true;
+    const loop = () => {
+      if (!window.__oasisSampling) return;
       const state = window.__oasisDebug?.();
-      if (!state) continue;
-      samples.push({
-        t: Math.round(performance.now() - started),
-        speed: Number(Math.hypot(state.vx, state.vz).toFixed(3)),
-        x: state.x,
-        z: state.z,
-      });
-    }
-    return samples;
-  }, ms);
+      if (state) {
+        samples.push({
+          t: Math.round(performance.now()),
+          speed: Number(Math.hypot(state.vx, state.vz).toFixed(3)),
+          simTicks: state.simTicks,
+        });
+      }
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  });
+  await page.waitForFunction(() => (window.__oasisSamples?.length ?? 0) >= 1, {
+    timeout: 15_000,
+    polling: 50,
+  });
+}
+
+/** Останавливает сбор и возвращает образцы. */
+export const stopSampling = (page) =>
+  page.evaluate(() => {
+    window.__oasisSampling = false;
+    return window.__oasisSamples ?? [];
+  });
+
+/** Длительность тика предсказания, мс (`TICK_MS` в @oasis/protocol). */
+export const TICK_MS = 50;
+/** Ускорение и торможение, м/с² (`PLAYER_ACCEL` / `PLAYER_DECEL`). */
+export const PLAYER_ACCEL = 28;
+export const PLAYER_DECEL = 42;
 
 /**
- * Есть ли в профиле промежуточная скорость — признак плавного разгона.
+ * Прирост скорости, который физика объяснить не может.
  *
- * Мгновенный прыжок с 0 на 5 даёт только 0 и 5; плавный разгон обязательно
- * проходит через 1–4 м/с.
+ * Почему не «есть ли в выборке промежуточная скорость»: на 3 fps разгон
+ * 0 → 5 занимает 0.18 с и целиком укладывается между двумя кадрами, поэтому
+ * промежуточной скорости в выборке просто нет — проверка врала бы на
+ * зелёном коде (так CI и упал). Предел прироста за тик держится при любом
+ * fps: 28 м/с² × 0.05 с = 1.4 м/с, а мгновенный разгон даёт 5 м/с за один
+ * тик. Число тиков берём из самих образцов, а не из времени.
+ *
+ * Слепая зона: если один кадр успевает проинтегрировать 4+ тика (200 мс
+ * симуляции), скачок 0 → 5 в него укладывается. Сейчас это невозможно:
+ * клиент ограничивает шаг кадра 100 мс, то есть максимум 2 тика.
  */
-export function hasIntermediateSpeed(samples, { min = 0.6, max = 4.4 } = {}) {
-  return samples.some((sample) => sample.speed > min && sample.speed < max);
+export function unexplainedSpeedGrowth(samples, accel = PLAYER_ACCEL) {
+  const found = [];
+  for (let i = 1; i < samples.length; i += 1) {
+    const prev = samples[i - 1];
+    const next = samples[i];
+    const ticks = next.simTicks - prev.simTicks;
+    const allowed = (accel * ticks * TICK_MS) / 1000 + 0.05;
+    const growth = next.speed - prev.speed;
+    if (growth > allowed) {
+      found.push(
+        `${prev.speed} → ${next.speed} м/с за ${ticks} тик(ов) ` +
+          `(физика разрешает ${allowed.toFixed(2)})`,
+      );
+    }
+  }
+  return found;
+}
+
+/** То же для торможения: скорость не может упасть быстрее, чем даёт decel. */
+export function unexplainedSpeedDrop(samples, decel = PLAYER_DECEL) {
+  const found = [];
+  for (let i = 1; i < samples.length; i += 1) {
+    const prev = samples[i - 1];
+    const next = samples[i];
+    const ticks = next.simTicks - prev.simTicks;
+    const allowed = (decel * ticks * TICK_MS) / 1000 + 0.05;
+    const drop = prev.speed - next.speed;
+    if (drop > allowed) {
+      found.push(
+        `${prev.speed} → ${next.speed} м/с за ${ticks} тик(ов) ` +
+          `(физика разрешает ${allowed.toFixed(2)})`,
+      );
+    }
+  }
+  return found;
 }
 
 /** Дочерние элементы лога чата — чтобы проверить, что сообщение дошло. */

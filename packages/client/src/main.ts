@@ -575,6 +575,8 @@ async function main(): Promise<void> {
     })),
     selfName: selfName,
     lastTick: state.lastTick,
+    /** Сколько тиков предсказания проинтегрировано (тик — 50 мс). */
+    simTicks: localPlayer?.simTicks ?? 0,
     keys: [...input.keys],
     frames: frameCounter,
     /** Зона, в которой игрок находится сейчас: id и границы. */
