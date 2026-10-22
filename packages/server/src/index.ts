@@ -19,7 +19,8 @@ import cors from 'cors';
 import express from 'express';
 
 import { config, logError, logInfo, REPO_ROOT } from './config.ts';
-import { SectorRoom, sectorRooms } from './rooms/SectorRoom.ts';
+import { handleSession } from './http/session.ts';
+import { SectorRoom, sectorRooms } from './rooms/SectorRoom.ts';)
 import { createStore } from './store/index.ts';
 import { loadWorld } from './world/loadWorld.ts';
 
@@ -28,8 +29,15 @@ async function main(): Promise<void> {
   const store = await createStore();
 
   const app = express();
-  app.use(cors());
+  app.use(cors({ origin: true, credentials: true }));
   app.use(express.json());
+
+  app.get('/auth/session', (request, response) => {
+    handleSession(request, response);
+  });
+  app.post('/auth/session', (request, response) => {
+    handleSession(request, response);
+  });
 
   app.get('/health', (_request, response) => {
     response.json({ ok: true, ts: Date.now(), world: world.id, version: world.version });

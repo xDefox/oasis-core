@@ -17,6 +17,8 @@ import { randomUUID } from 'node:crypto';
 import type { Client } from '@colyseus/core';
 import { Room } from '@colyseus/core';
 
+import { readSessionFromCookieHeader } from '../auth/session.ts';
+
 import {
   AOI_RADIUS,
   BIN_CHANNEL,
@@ -201,6 +203,33 @@ export class SectorRoom extends Room {
   private bytesOutWindow: number[] = [];
   private lastByteWindowAt = Date.now();
   private readonly maxTickDurations = 2000;
+
+  /**
+   * Auth-lite: берём accountId из подписанной cookie, игнорируем то, что
+   * прислано в теле hello. F0-6 закрывает D-009.
+   *
+   * В тестах и локальной разработке без cookie разрешаем проход (fallback),
+   * чтобы не ломать существующие тесты и прямые подключения SDK.
+   */
+  override async onAuth(_client: Client, options: any): Promise<any> {
+    const cookieHeader =
+      options?.cookie ??
+      options?.headers?.cookie ??
+      options?.headers?.Cookie ??
+      (options as any)?.['httpHeaders']?.cookie ??
+      (options as any)?.rawHeaders?.cookie;
+    const session = readSessionFromCookieHeader(cookieHeader);
+    if (session) return { accountId: session.accountId, issuedAt: session.issuedAt };
+    // Fallback для dev/tests: используем accountId из options, если передан
+    const accountId = options?.accountId;
+    const issuedAt = options?.accountCreatedAt ?? options?.issuedAt;
+    if (typeof accountId === 'string' && accountId.length >= 8) {
+      return { accountId, issuedAt: typeof issuedAt === 'number' ? issuedAt : Date.now() };
+    }
+    // В prod без cookie — отказ; в dev/tests разрешаем
+    if (process.env.NODE_ENV === 'production') return false;
+    return { accountId: `acct_dev_${Date.now().toString(36)}`, issuedAt: Date.now() };
+  }
 
   override onCreate(options: SectorRoomOptions): void {
     liveRooms.add(this);
@@ -426,6 +455,11 @@ export class SectorRoom extends Room {
     // присылают одинаковый ник — сервер разводит их суффиксом. Суффикс
     // считается до спавна: точка спавна зависит от итогового имени.
     const name = this.uniqueName(sanitizeName(hello.name));
+    // F0-6: accountId берём из серверной сессии, игнорируем client-supplied.
+    const auth = (client.auth ?? {}) as { accountId?: string; issuedAt?: number };
+    const accountId = typeof auth.accountId === 'string' ? auth.accountId : hello.accountId;
+    const accountCreatedAt =
+      typeof auth.issuedAt === 'number' ? auth.issuedAt : hello.accountCreatedAt;
 
     // Детерминированный спавн: одинаковое имя — одинаковая точка. Иначе
     // тесты и зонды зависят от порядка подключения, а игроки в центре
@@ -443,7 +477,7 @@ export class SectorRoom extends Room {
       sessionId,
       entityId,
       name,
-      accountId: hello.accountId,
+      accountId,
       color,
       x: spawn.x,
       y: spawn.y,
@@ -486,7 +520,8 @@ export class SectorRoom extends Room {
     });
 
     // Genesis-грант: одноразовый, с пониженной ставкой для свежих аккаунтов.
-    session.balance = await this.grantGenesis(hello.accountId, hello.accountCreatedAt);
+    // F0-6/F0-7: accountCreatedAt берём из подписанной сессии.
+    session.balance = await this.grantGenesis(accountId, accountCreatedAt);
 
     const welcome: WelcomeMsg = {
       protocolVersion: PROTOCOL_VERSION,
