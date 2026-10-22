@@ -320,6 +320,13 @@ export class SectorRoom extends Room {
     // присылают одинаковый ник — сервер разводит их суффиксом. Суффикс
     // считается до спавна: точка спавна зависит от итогового имени.
     const name = this.uniqueName(sanitizeName(hello.name));
+    // F0-6/F0-7: accountId и accountCreatedAt берём из серверной сессии,
+    // игнорируем client-supplied. D-009 закрыт.
+    const auth = (client.auth ?? {}) as { accountId?: string; issuedAt?: number };
+    const hasServerAuth = typeof auth.accountId === 'string';
+    const accountId: string = (hasServerAuth ? auth.accountId : hello.accountId) ?? `acct_fallback_${client.sessionId}`;
+    const accountCreatedAt: number =
+      hasServerAuth && typeof auth.issuedAt === 'number' ? auth.issuedAt : hello.accountCreatedAt;
 
     // Детерминированный спавн: одинаковое имя — одинаковая точка. Иначе
     // тесты и зонды зависят от порядка подключения, а игроки в центре
@@ -337,7 +344,7 @@ export class SectorRoom extends Room {
       sessionId,
       entityId,
       name,
-      accountId: hello.accountId,
+      accountId,
       color,
       x: spawn.x,
       y: spawn.y,
@@ -371,7 +378,8 @@ export class SectorRoom extends Room {
     });
 
     // Genesis-грант: одноразовый, с пониженной ставкой для свежих аккаунтов.
-    session.balance = await this.grantGenesis(hello.accountId, hello.accountCreatedAt);
+    // F0-6/F0-7: accountCreatedAt берём из подписанной сессии.
+    session.balance = await this.grantGenesis(accountId, accountCreatedAt);
 
     const welcome: WelcomeMsg = {
       protocolVersion: PROTOCOL_VERSION,
