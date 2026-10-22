@@ -74,8 +74,8 @@ if (unique.size !== rosterNames.length) {
   problems.add(`в ростере дубли имён: ${rosterNames.join(', ')}`);
 }
 
-await first.screenshot({ path: '/tmp/oasis-names-first.png' });
-await second.screenshot({ path: '/tmp/oasis-names-second.png' });
+await first.screenshot({ path: '/tmp/oasis-names-first.png' }).catch(() => {});
+await second.screenshot({ path: '/tmp/oasis-names-second.png' }).catch(() => {});
 
 await browser.close();
 problems.finish();

@@ -98,7 +98,7 @@ if (!betaChat.some((line) => line.includes('теперь ты «ренамед (
 
 // ── ник сохраняется между сессиями ──────────────────────────────────────
 // (проверка стоит выше — сразу после своей смены: localStorage общий на профиль)
-await alpha.screenshot({ path: '/tmp/oasis-rename.png' });
+await alpha.screenshot({ path: '/tmp/oasis-rename.png' }).catch(() => {});
 
 await browser.close();
 problems.finish();
