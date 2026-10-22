@@ -42,6 +42,7 @@ interface Recorder {
   chats: ChatBroadcastMsg[];
   teleports: TeleportMsg[];
   balance?: number;
+  renamed: string[];
   snapshots: { tick: number; entities: EntityState[] }[];
   deltas: { tick: number; changed: EntityState[]; removed: number[] }[];
 }
@@ -50,12 +51,15 @@ function recorder(room: {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   onMessage(type: string, callback: (message: any) => void): unknown;
 }): Recorder {
-  const record: Recorder = { chats: [], teleports: [], snapshots: [], deltas: [] };
+  const record: Recorder = { chats: [], teleports: [], renamed: [], snapshots: [], deltas: [] };
   room.onMessage('welcome', (message: WelcomeMsg) => {
     record.welcome = message;
   });
   room.onMessage('roster', (message: RosterMsg) => {
     record.roster = message;
+  });
+  room.onMessage('renamed', (message: { name: string }) => {
+    record.renamed.push(message.name);
   });
   room.onMessage('chat', (message: ChatBroadcastMsg) => {
     record.chats.push(message);
@@ -253,6 +257,67 @@ describe('вертикальный срез: два игрока видят др
     await firstRoom.leave();
     await secondRoom.leave();
     await thirdRoom.leave();
+  });
+
+  it('переименовывает игрока и разводит совпадение суффиксом', async () => {
+    // Смена ника — команда `/name` на клиенте, но решает сервер: он же
+    // авторитет по реестру сектора. Тест проверяет обе ветки — успешную
+    // смену и конфликт с уже занятым именем.
+    const alpha = new Client(`ws://localhost:${PORT}`);
+    const beta = new Client(`ws://localhost:${PORT}`);
+
+    const { room: alphaRoom, record: alphaRecord } = await joinWorld(alpha, {
+      accountId: 'acct_rename_alpha_001',
+      accountCreatedAt: Date.now() - 5 * 24 * 60 * 60 * 1000,
+      name: 'rename-alpha',
+    });
+    const { room: betaRoom, record: betaRecord } = await joinWorld(beta, {
+      accountId: 'acct_rename_beta_0002',
+      accountCreatedAt: Date.now() - 5 * 24 * 60 * 60 * 1000,
+      name: 'rename-beta',
+    });
+    await waitFor(() => alphaRecord.welcome, 8000, 'welcome alpha');
+    await waitFor(() => betaRecord.welcome, 8000, 'welcome beta');
+
+    // Успешная смена.
+    alphaRoom.send('rename', { name: 'новый-ник' });
+    const renamed = await waitFor(() => alphaRecord.renamed[0], 8000, 'renamed alpha');
+    assert.equal(renamed, 'новый-ник');
+
+    // Ростер у второго игрока обновился.
+    const rosterAfterRename = await waitFor(
+      () => {
+        const current = betaRecord.roster;
+        return current?.players.some((player) => player.name === 'новый-ник')
+          ? current
+          : undefined;
+      },
+      8000,
+      'ростер с новым ником',
+    );
+    assert.ok(
+      rosterAfterRename.players.some((player) => player.name === 'новый-ник'),
+      'в ростере нет нового ника',
+    );
+    assert.ok(
+      !rosterAfterRename.players.some((player) => player.name === 'rename-alpha'),
+      'старый ник остался в ростере',
+    );
+
+    // Конфликт: бета пытается взять имя, которое уже занято.
+    betaRoom.send('rename', { name: 'новый-ник' });
+    const conflicted = await waitFor(() => betaRecord.renamed[0], 8000, 'renamed beta');
+    assert.equal(conflicted, 'новый-ник (2)');
+
+    // Просьба оставить своё же имя не должна превращаться в «имя (2)».
+    alphaRecord.renamed.length = 0;
+    alphaRoom.send('rename', { name: 'новый-ник' });
+    // Сервер ничего не меняет и не шлёт ответ — ждём, что ответа нет.
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    assert.equal(alphaRecord.renamed.length, 0, 'сервер переименовал в то же имя с суффиксом');
+
+    await alphaRoom.leave();
+    await betaRoom.leave();
   });
 
   it('показывает второго игрока и двигает его по дельтам', async () => {
@@ -466,6 +531,103 @@ describe('вертикальный срез: два игрока видят др
 
     await alphaRoom.leave();
     await betaRoom.leave();
+  });
+
+  it('игрок без ввода останавливается: ввод клиента протухает', async () => {
+    // Если клиент замолчал (обрыв, вкладка в фоне, потеря сети), сервер
+    // не должен тащить его вперёд последним нажатием до бесконечности.
+    // Раньше это правило было в коде, но ни один тест его не проверял.
+    const client = new Client(`ws://localhost:${PORT}`);
+    const { room, record } = await joinWorld(client, {
+      accountId: 'acct_ttl_000000000001',
+      accountCreatedAt: Date.now() - 5 * 24 * 60 * 60 * 1000,
+      name: 'ttl',
+    });
+    await waitFor(() => record.welcome, 8000, 'welcome');
+
+    // Один-единственный ввод — дальше клиент молчит.
+    room.sendBytes(BIN_CHANNEL, encodeInput({ seq: 1, dirX: 1, dirZ: 0, yaw: 0, sprint: true }));
+
+    // Ждём заметно дольше TTL ввода (1 с).
+    await new Promise((resolve) => setTimeout(resolve, 2500));
+
+    const own = record.deltas
+      .flatMap((delta) => delta.changed)
+      .filter((entity) => entity.id === record.welcome?.playerId)
+      .at(-1);
+    assert.ok(own, 'сервер не прислал состояние игрока');
+
+    // Без TTL игрок доехал бы до стены z_plaza (x = 32). С TTL он должен
+    // замереть там, где остановился.
+    assert.ok(
+      own.x < 12,
+      `игрок с мёртвым вводом продолжает ехать: x=${own.x} (ждали остановки)`,
+    );
+
+    await room.leave();
+  });
+
+  it('кулдаун портала не даёт улететь обратно, если держать клавишу', async () => {
+    // Игрок приходит в z_grove и продолжает жать в сторону обратного
+    // портала. Без кулдауна его мгновенно уносит назад, потом вперёд —
+    // бесконечный пинг-понг.
+    const client = new Client(`ws://localhost:${PORT}`);
+    const room = await client.joinOrCreate('sector_portal', {
+      protocolVersion: PROTOCOL_VERSION,
+      accountId: 'acct_cooldown_000001',
+      accountCreatedAt: Date.now() - 5 * 24 * 60 * 60 * 1000,
+      name: 'cooldown',
+    });
+    const record = recorder(room);
+    room.send('hello', { protocolVersion: PROTOCOL_VERSION });
+
+    // Идём в портал своим ходом: спавн разбрасывает игрока по хэшу имени,
+    // и полагаться на то, что он случайно оказался внутри, нельзя.
+    let seq = 0;
+    let pumping = true;
+    const pumpingTask = (async () => {
+      while (pumping) {
+        seq += 1;
+        room.sendBytes(
+          BIN_CHANNEL,
+          encodeInput({ seq, dirX: 1, dirZ: 0, yaw: 0, sprint: true }),
+        );
+        await new Promise((resolve) => setTimeout(resolve, 40));
+      }
+    })();
+
+    const first = await waitFor(() => record.teleports[0], 8000, 'первый телепорт');
+    assert.equal(first.zoneId, 'z_grove');
+
+    // Теперь жмём в сторону обратного портала (в z_grove он на x = 92,
+    // игрок прибывает за ним, дальше по +X). Направление меняем на -X.
+    pumping = false;
+    await pumpingTask;
+
+    let pumpingBack = true;
+    const pumpingBackTask = (async () => {
+      while (pumpingBack) {
+        seq += 1;
+        room.sendBytes(
+          BIN_CHANNEL,
+          encodeInput({ seq, dirX: -1, dirZ: 0, yaw: 0, sprint: true }),
+        );
+        await new Promise((resolve) => setTimeout(resolve, 40));
+      }
+    })();
+
+    // Ждём меньше кулдауна (1.2 с) — второй телепорт быть не должно.
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    pumpingBack = false;
+    await pumpingBackTask;
+
+    assert.equal(
+      record.teleports.length,
+      1,
+      `игрока унесло обратно, пока держал клавишу: телепортов ${record.teleports.length}`,
+    );
+
+    await room.leave();
   });
 
   it('отказывает клиенту с чужой версией протокола', async () => {

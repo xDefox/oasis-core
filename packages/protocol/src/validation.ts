@@ -49,6 +49,10 @@ export const pingSchema = z.object({
   t: z.number().finite(),
 });
 
+export const renameSchema = z.object({
+  name: z.string().trim().min(1).max(24),
+});
+
 // ───────────────────────────────────────────────── валидация world.json ────
 
 const flagsSchema = z.object({

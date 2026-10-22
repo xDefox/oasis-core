@@ -39,6 +39,7 @@ import {
   type EntityState,
   type HelloMsg,
   type PlayerInfo,
+  type WelcomeMsg,
   type WorldDef,
 } from '@oasis/protocol';
 import {
@@ -47,6 +48,7 @@ import {
   helloSchema,
   inputSchema,
   pingSchema,
+  renameSchema,
   zoneRequestSchema,
 } from '@oasis/protocol/validation';
 
@@ -69,6 +71,8 @@ interface Session {
   name: string;
   accountId: string;
   color: number;
+  /** Кешируем welcome, чтобы при переименовании сразу переслать свежий. */
+  welcome?: WelcomeMsg;
   x: number;
   y: number;
   z: number;
@@ -218,6 +222,22 @@ export class SectorRoom extends Room {
       client.send(S2C.Pong, { t: message.t, serverTime: Date.now() });
     });
 
+    this.onMessage(C2S.Rename, renameSchema, (client, message) => {
+      const session = this.sessions.get(client.sessionId);
+      if (!session) return;
+      const base = sanitizeName(message.name);
+      const next = this.uniqueName(base, session);
+      // Уникализация учитывает и своё текущее имя. Если игрок выбрал то же
+      // самое — ничего не меняем.
+      if (next === session.name) return;
+      session.name = next;
+      if (session.welcome) session.welcome.name = next;
+      // Правило сервера: ник — не то, что игрок попросил, а то, что выдано.
+      // Клиент показывает именно `name` из ответа.
+      client.send(S2C.Renamed, { name: next });
+      this.broadcastRoster();
+    });
+
     this.onMessage(C2S.Hello, helloHandshakeSchema, (client, message) => {
       const hello = this.pending.get(client.sessionId);
       if (!hello) return;
@@ -353,7 +373,7 @@ export class SectorRoom extends Room {
     // Genesis-грант: одноразовый, с пониженной ставкой для свежих аккаунтов.
     session.balance = await this.grantGenesis(hello.accountId, hello.accountCreatedAt);
 
-    client.send(S2C.Welcome, {
+    const welcome: WelcomeMsg = {
       protocolVersion: PROTOCOL_VERSION,
       playerId: entityId,
       name,
@@ -380,7 +400,9 @@ export class SectorRoom extends Room {
       aoiRadius: AOI_RADIUS,
       spawn,
       balance: session.balance,
-    });
+    };
+    session.welcome = welcome;
+    client.send(S2C.Welcome, welcome);
     client.send(S2C.Balance, { balance: session.balance, reason: 'genesis' });
 
     this.broadcastRoster();
@@ -471,10 +493,14 @@ export class SectorRoom extends Room {
    * путаница та же. Суффикс уходит в обычный текст, так что длина имени
    * может слегка превысить лимит 24 знака: это дешевле, чем обрезать
    * суффикс и снова получить дубль.
+   *
+   * `exclude` — сессия, чьё имя не считать занятым. Без него игрок,
+   * попросивший своё же имя, получил бы `имя (2)`.
    */
-  private uniqueName(base: string): string {
+  private uniqueName(base: string, exclude?: Session): string {
     const taken = new Set<string>();
     for (const session of this.sessions.values()) {
+      if (session === exclude) continue;
       taken.add(session.name.toLowerCase());
     }
     if (!taken.has(base.toLowerCase())) return base;

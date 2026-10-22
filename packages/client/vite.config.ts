@@ -3,8 +3,11 @@ import { defineConfig } from 'vite';
 export default defineConfig({
   server: {
     port: 5173,
+    // Зонды и CI ходят на фиксированный порт: если vite «уедет» на 5174,
+    // браузерные тесты будут стучаться в пустоту и это будет выглядеть как
+    // падение продукта, а не порта.
+    strictPort: true,
     host: true,
-    strictPort: false,
   },
   build: {
     target: 'esnext',

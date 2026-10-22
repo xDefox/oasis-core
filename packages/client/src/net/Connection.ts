@@ -17,6 +17,7 @@ import {
   type HelloMsg,
   type InputMsg,
   type PongMsg,
+  type RenamedMsg,
   type RosterMsg,
   type TeleportMsg,
   type WelcomeMsg,
@@ -33,6 +34,7 @@ export interface ConnectionHandlers {
   onBinary(payload: Uint8Array): void;
   onPong(message: PongMsg): void;
   onError(message: ErrorMsg): void;
+  onRenamed(message: RenamedMsg): void;
   onStatus(status: 'connecting' | 'open' | 'closed' | 'error', detail?: string): void;
 }
 
@@ -62,6 +64,7 @@ export class Connection {
     );
     room.onMessage('pong', (message: PongMsg) => handlers.onPong(message));
     room.onMessage('error', (message: ErrorMsg) => handlers.onError(message));
+    room.onMessage('renamed', (message: RenamedMsg) => handlers.onRenamed(message));
     room.onMessage(BIN_CHANNEL, (payload: Uint8Array) => handlers.onBinary(payload));
 
     room.onError((code, message) => {
@@ -94,6 +97,11 @@ export class Connection {
   sendChat(text: string): void {
     if (!this.connected) return;
     this.room?.send(C2S.Chat, { text });
+  }
+
+  rename(name: string): void {
+    if (!this.connected) return;
+    this.room?.send(C2S.Rename, { name });
   }
 
   requestZone(zoneId: string): void {

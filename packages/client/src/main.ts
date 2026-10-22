@@ -22,6 +22,7 @@ import {
   decodeSnapshot,
   type ChatBroadcastMsg,
   type PortalDef,
+  type RenamedMsg,
   type RosterMsg,
   type TeleportMsg,
   type WelcomeMsg,
@@ -85,6 +86,17 @@ function loadName(): string {
   return name;
 }
 
+/**
+ * Запоминает ник, который игрок выбрал сам (`/name`).
+ *
+ * Сохраняется только явный выбор. Суффикс `(2)`, выданный сервером при
+ * совпадении двух вкладок, не записывается: это временное разведение, а не
+ * новое имя — иначе оно прилипло бы к игроку навсегда.
+ */
+function saveName(name: string): void {
+  window.localStorage.setItem(NAME_KEY, name);
+}
+
 async function main(): Promise<void> {
   const canvas = document.getElementById('scene') as HTMLCanvasElement;
   const { renderer, scene, camera, backend } = await createRenderer(canvas);
@@ -106,13 +118,47 @@ async function main(): Promise<void> {
   scene.add(sceneRoot);
 
   const hud = new Hud({
-    onChat: (text) => connection.sendChat(text),
+    onChat: (text) => {
+      // Команды начинаются с `/` и в мир не уходят. Пока это только ник:
+      // сервер — авторитет по реестру, поэтому он же решает, свободен ли он.
+      if (text.startsWith('/')) {
+        handleCommand(text);
+        return;
+      }
+      connection.sendChat(text);
+    },
     onChatFocusChange: (focused) => {
       // Пока печатаешь — мышь не должна крутить камеру.
       if (focused) document.exitPointerLock?.();
     },
     onRequestControl: () => input.requestControl(),
   });
+
+  /**
+   * Команды чата. Неизвестную команду не отправляем в мир: игрок опечатался,
+   * а не пытался сказать что-то всем.
+   */
+  function handleCommand(text: string): void {
+    const [rawCommand, ...rest] = text.slice(1).split(/\s+/);
+    const command = rawCommand?.toLowerCase() ?? '';
+
+    if (command === 'name') {
+      const requested = rest.join(' ').trim();
+      if (!requested) {
+        hud.addChatLine(null, 'использование: /name новый-ник');
+        return;
+      }
+      connection.rename(requested);
+      return;
+    }
+
+    if (command === 'help') {
+      hud.addChatLine(null, 'команды: /name <ник>, /help');
+      return;
+    }
+
+    hud.addChatLine(null, `неизвестная команда «${rawCommand}» — /help`);
+  }
 
   const input = new Input(canvas, (locked) => {
     hud.setCrosshair(locked);
@@ -146,6 +192,21 @@ async function main(): Promise<void> {
       }
     }
     return nearest;
+  }
+
+  /**
+   * Зона под игроком — по его актуальной позиции.
+   *
+   * Границы зоны нужны зонду, чтобы проверять не «дошёл ли игрок до
+   * конкретной стены», а «всегда ли он внутри своей зоны». Первая
+   * проверка ломалась о портал: игрок уходил в соседнюю зону, и тест
+   * называл это «вышел за границу».
+   */
+  function currentZone(): { id: string; bounds: ZoneSummary['bounds'] } | null {
+    if (!localPlayer) return null;
+    const zone = zoneAt(localPlayer.x, localPlayer.z);
+    if (!zone) return null;
+    return { id: zone.id, bounds: zone.bounds };
   }
 
   /** Аватары — событие ростера, а не таймер. Имя тоже обновляем здесь. */
@@ -206,6 +267,12 @@ async function main(): Promise<void> {
 
     onChat(message: ChatBroadcastMsg): void {
       hud.addChatLine(message.name, message.text);
+    },
+
+    onRenamed(message: RenamedMsg): void {
+      selfName = message.name;
+      saveName(message.name);
+      hud.addChatLine(null, `теперь ты «${message.name}»`);
     },
 
     onZone(message: ZoneMsg): void {
@@ -510,6 +577,8 @@ async function main(): Promise<void> {
     lastTick: state.lastTick,
     keys: [...input.keys],
     frames: frameCounter,
+    /** Зона, в которой игрок находится сейчас: id и границы. */
+    zone: currentZone(),
   });
 
   (window as unknown as { __oasisWarp?: (x: number, z: number) => void }).__oasisWarp = (

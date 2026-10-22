@@ -1,0 +1,111 @@
+# Проверки на каждый PR и push в main.
+#
+# Два уровня намеренно разделены:
+#   static  — typecheck и unit-тесты. Секунды, ловит 90% ошибок.
+#   browser — реальный мир в headless Chromium. Минуты, ловит то, что
+#             unit-тесты не видят (пустая сцена, призраки, дубли ников).
+#
+# Разделение важно: если browser-джоб флапнет, он не должен маскировать
+# быстрый и честный вердикт static.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Второй push в ту же ветку отменяет предыдущий прогон: смысла в очереди нет.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  static:
+    name: typecheck + tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+
+      # Разрешения на install-scripts лежат в package.json (`allowScripts`),
+      # поэтому отдельного шага не нужно. npm 11 по умолчанию их блокирует,
+      # и без esbuild не собирается ни vite, ни клиент.
+      - run: npm ci
+
+      - name: typecheck
+        run: npm run typecheck
+
+      - name: unit-тесты
+        run: npm test
+
+      - name: сборка клиента
+        run: npm run build
+
+  mutation:
+    name: мутации (тесты не врут?)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: static
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+
+      # Ломаем код по одному правилу и смотрим, какой тест упал. Тест,
+      # который проходит и на сломанном коде, хуже отсутствия теста: он
+      # создаёт ложную уверенность. Плейтест 22.10 показал это дважды.
+      - name: мутационная проверка
+        run: node scripts/mutation-check.mjs
+
+  browser:
+    name: headless-мир
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: static
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+
+      # chromium из Ubuntu: puppeteer-core не качает свой бинарь, ему нужен
+      # системный. --with-deps тянет библиотеки шрифтов и GL.
+      - name: Установить chromium
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends chromium-browser || \
+            sudo apt-get install -y --no-install-recommends chromium
+
+      - name: Прогнать браузерные зонды
+        env:
+          CHROMIUM_PATH: /usr/bin/chromium-browser
+          OASIS_VERBOSE: '1'
+        run: |
+          if [ ! -x "$CHROMIUM_PATH" ]; then export CHROMIUM_PATH=/usr/bin/chromium; fi
+          npm run test:browser
+
+      # Скриншоты — единственный артефакт, который помогает глазами понять,
+      # что именно было не так, когда зонд упал в CI.
+      - name: Скриншоты зондов
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-screenshots
+          path: /tmp/oasis-*.png
+          if-no-files-found: ignore
+          retention-days: 7

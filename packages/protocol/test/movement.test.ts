@@ -67,6 +67,37 @@ describe('движение: разгон, торможение, ограниче
     );
   });
 
+  it('разгон не мгновенный: скорость растёт постепенно', () => {
+    // Раньше ни один тест этого не проверял: если скорость прыгает с 0 на 5
+    // одним шагом, все остальные проверки (целевая скорость, торможение)
+    // остаются довольны. А по ощущениям это «скольжение по льду» — баг,
+    // который мы чинили 22.10.
+    const after1tick = run(1, 0, false, 1);
+    const afterHalf = run(1, 0, false, TICK_RATE / 2);
+
+    assert.ok(
+      speedOf(after1tick.vx, after1tick.vz) < PLAYER_SPEED,
+      'за один тик скорость уже на цели — разгона нет',
+    );
+    assert.ok(
+      speedOf(after1tick.vx, after1tick.vz) > 0.5,
+      'скорость не растёт совсем: разгон сломан иначе',
+    );
+
+    // Скорость растёт, а не стоит на месте.
+    assert.ok(
+      speedOf(afterHalf.vx, afterHalf.vz) > speedOf(after1tick.vx, after1tick.vz),
+      'скорость не растёт со временем',
+    );
+
+    // И достигает цели за разумное время, а не через минуту.
+    const after1s = run(1, 0, false, TICK_RATE);
+    assert.ok(
+      Math.abs(speedOf(after1s.vx, after1s.vz) - PLAYER_SPEED) < 0.05,
+      `за секунду скорость ${speedOf(after1s.vx, after1s.vz)} вместо ${PLAYER_SPEED}`,
+    );
+  });
+
   it('останавливается за конечное время и тормозит быстрее разгона', () => {
     const moving = run(1, 0, false, TICK_RATE);
     let vx = moving.vx;

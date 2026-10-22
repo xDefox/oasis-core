@@ -166,6 +166,10 @@ export interface PingMsg {
   t: number;
 }
 
+export interface RenameMsg {
+  name: string;
+}
+
 // ───────────────────────────────────────────────────── сообщения (S→C) ────
 
 export interface WelcomeMsg {
@@ -216,6 +220,11 @@ export interface BalanceMsg {
 export interface PongMsg {
   t: number;
   serverTime: number;
+}
+
+/** Ответ на успешное переименование. Имя может отличаться от запрошенного. */
+export interface RenamedMsg {
+  name: string;
 }
 
 export interface ErrorMsg {

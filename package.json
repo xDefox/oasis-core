@@ -19,11 +19,17 @@
     "build": "npm run build -w @oasis/client",
     "start": "npm run start -w @oasis/server",
     "typecheck": "npm run typecheck -w @oasis/protocol && npm run typecheck -w @oasis/server && npm run typecheck -w @oasis/client",
-    "test": "node --import tsx --test \"packages/*/test/**/*.test.ts\""
+    "test": "node --import tsx --test \"packages/*/test/**/*.test.ts\"",
+    "test:browser": "node scripts/browser-test.mjs"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
+    "puppeteer-core": "^24.0.0",
     "tsx": "^4.23.15",
     "typescript": "^5.9.0"
+  },
+  "allowScripts": {
+    "esbuild": true,
+    "msgpackr-extract": true
   }
 }

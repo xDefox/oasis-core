@@ -6,7 +6,7 @@
  * Любое изменение здесь ломает предсказание → требует bump PROTOCOL_VERSION.
  */
 
-export const PROTOCOL_VERSION = '0.1.0';
+export const PROTOCOL_VERSION = '0.2.0';
 
 /** Частота серверной симуляции, Гц. */
 export const TICK_RATE = 20;
@@ -63,6 +63,7 @@ export const C2S = {
   Chat: 'chat',
   ZoneRequest: 'zone_request',
   Ping: 'ping',
+  Rename: 'rename',
 } as const;
 
 export const S2C = {
@@ -74,6 +75,7 @@ export const S2C = {
   Balance: 'balance',
   Pong: 'pong',
   Error: 'error',
+  Renamed: 'renamed',
 } as const;
 
 /** Единый бинарный канал: клиент и сервер гоняют только его. */
