@@ -171,6 +171,18 @@ async function main(): Promise<void> {
     connection.requestZone(zoneId);
   }
 
+  /**
+   * F0-9: зоны не копятся. При уходе оставляем только текущую; ресурсы
+   * (включая порталы, вложенные в группу зоны) освобождаются через disposeGroup.
+   */
+  function unloadZonesExcept(keepId: string | null): void {
+    for (const [id, group] of [...zoneGroups]) {
+      if (keepId !== null && id === keepId) continue;
+      disposeGroup(group);
+      zoneGroups.delete(id);
+    }
+  }
+
   function zoneAt(x: number, z: number): ZoneSummary | undefined {
     let nearest: ZoneSummary | undefined;
     let nearestDistance = Number.POSITIVE_INFINITY;
@@ -277,15 +289,22 @@ async function main(): Promise<void> {
 
     onZone(message: ZoneMsg): void {
       const zone = message.zone;
-      if (zoneGroups.has(zone.id)) return;
-      const group = buildZone(zone);
-      sceneRoot.add(group);
-      zoneGroups.set(zone.id, group);
-
-      for (const portal of worldPortals) {
-        if (portal.fromZone !== zone.id) continue;
-        sceneRoot.add(buildPortal(portal));
+      if (!zoneGroups.has(zone.id)) {
+        const group = buildZone(zone);
+        // Порталы — дети группы зоны: выгрузка зоны уносит их вместе с ней.
+        for (const portal of worldPortals) {
+          if (portal.fromZone !== zone.id) continue;
+          group.add(buildPortal(portal));
+        }
+        sceneRoot.add(group);
+        zoneGroups.set(zone.id, group);
       }
+
+      // Держим в сцене только зону под ногами (или только что пришедшую).
+      const keepId = localPlayer
+        ? (zoneAt(localPlayer.x, localPlayer.z)?.id ?? zone.id)
+        : zone.id;
+      unloadZonesExcept(keepId);
 
       // Если игрок уже в этой зоне — обновляем границы предсказания.
       if (localPlayer) {
@@ -302,6 +321,9 @@ async function main(): Promise<void> {
         localPlayer.setBounds(zone?.bounds ?? null);
         localPlayer.teleportTo(message.position.x, message.position.z);
       }
+      // Старую геометрию снимаем сразу: иначе после нескольких порталов
+      // в памяти висят все посещённые зоны.
+      unloadZonesExcept(message.zoneId);
       requestZone(message.zoneId);
       hud.addChatLine(null, `переход в зону ${message.zoneId}`);
     },
@@ -561,6 +583,8 @@ async function main(): Promise<void> {
     yaw: Number(input.yaw.toFixed(3)),
     cameraDistance: Number(camera.position.distanceTo(cameraTarget).toFixed(3)),
     zoneGroups: zoneGroups.size,
+    /** Id зон, реально лежащих в сцене (после F0-9 — не больше одной). */
+    loadedZones: [...zoneGroups.keys()],
     avatars: avatarGroups.size,
     roster: state.roster.size,
     /** Сколько чужих тел реально отрисовано (не спрятано) в данный момент. */

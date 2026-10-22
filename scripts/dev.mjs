@@ -42,7 +42,8 @@ for (const job of jobs) {
   const child = spawn(npm, job.args, {
     stdio: ['ignore', 'pipe', 'pipe'],
     env: { ...process.env, FORCE_COLOR: '1' },
-    shell: false,
+    // Windows: .cmd/.bat require a shell; Node 20+ rejects spawn without it (EINVAL).
+    shell: process.platform === 'win32',
   });
   children.push(child);
   child.stdout.on('data', (chunk) => prefixLine(job.name, job.color, chunk));
