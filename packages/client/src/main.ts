@@ -60,6 +60,27 @@ interface Account {
 }
 
 /** Стабильный id аккаунта в localStorage: пока нет серверной авторизации. */
+function randomId(): string {
+  const c = globalThis.crypto;
+  const maybeUUID = (c as unknown as { randomUUID?: () => string } | undefined)?.randomUUID;
+  if (typeof maybeUUID === 'function') {
+    return maybeUUID.call(c).replace(/-/g, '');
+  }
+  if (!c) throw new Error('crypto недоступен');
+  const getRandomValues = (c as Crypto).getRandomValues.bind(c);
+  const buf = new Uint8Array(16);
+  getRandomValues(buf);
+  // RFC4122 v4
+  buf[6] = (buf[6]! & 0x0f) | 0x40;
+  buf[8] = (buf[8]! & 0x3f) | 0x80;
+  let hex = '';
+  for (let i = 0; i < buf.length; i += 1) {
+    hex += buf[i]!.toString(16).padStart(2, '0');
+  }
+  return hex;
+}
+
+/** Стабильный id аккаунта в localStorage: пока нет серверной авторизации. */
 function loadAccount(): Account {
   const raw = window.localStorage.getItem(ACCOUNT_KEY);
   if (raw) {
@@ -71,11 +92,28 @@ function loadAccount(): Account {
     }
   }
   const account: Account = {
-    id: `acct_${crypto.randomUUID().replace(/-/g, '')}`,
+    id: `acct_${randomId()}`,
     createdAt: Date.now(),
   };
   window.localStorage.setItem(ACCOUNT_KEY, JSON.stringify(account));
   return account;
+}
+
+/** Получить подписанную сессию с сервера (auth-lite). */
+async function fetchServerSession(): Promise<Account | null> {
+  try {
+    const res = await fetch(`${SERVER_URL.replace(/^ws/, 'http')}/auth/session`, {
+      method: 'GET',
+      credentials: 'include',
+      cache: 'no-store',
+    });
+    if (!res.ok) return null;
+    const data = (await res.json()) as { accountId?: string; issuedAt?: number };
+    if (typeof data.accountId !== 'string' || typeof data.issuedAt !== 'number') return null;
+    return { id: data.accountId, createdAt: data.issuedAt };
+  } catch {
+    return null;
+  }
 }
 
 function loadName(): string {
@@ -381,7 +419,17 @@ async function main(): Promise<void> {
 
   // ── подключение ────────────────────────────────────────────────────────
 
-  const account = loadAccount();
+  let account = loadAccount();
+  // Auth-lite: приоритет у серверной подписанной сессии.
+  const serverAccount = await fetchServerSession();
+  if (serverAccount) {
+    account = serverAccount;
+    try {
+      window.localStorage.setItem(ACCOUNT_KEY, JSON.stringify(account));
+    } catch {
+      // ignore
+    }
+  }
   try {
     await connection.connect(
       SERVER_URL,
