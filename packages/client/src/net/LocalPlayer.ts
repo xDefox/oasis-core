@@ -20,8 +20,8 @@
  * уезжала вперёд от собственного аватара. Не повторяем.
  */
 
-import { stepVelocity } from '@oasis/protocol';
-import type { EntityState } from '@oasis/protocol';
+import { PLAYER_RADIUS, resolveCollisions, stepVelocity, zoneObstacles } from '@oasis/protocol';
+import type { CircleObstacle, EntityState, PropDef } from '@oasis/protocol';
 
 /** Больше этого — считаем «срывом» (реконнект, баг) и прыгаем. */
 const SNAP_DISTANCE = 6.0;
@@ -55,6 +55,7 @@ export class LocalPlayer {
   private dirZ = 0;
   private sprint = false;
   private bounds: ZoneBounds | null = null;
+  private obstacles: CircleObstacle[] = [];
   /** Максимальное отставание картинки от авторитета, метры. */
   private aheadAbs = 0;
 
@@ -109,6 +110,11 @@ export class LocalPlayer {
     this.clamp();
   }
 
+  /** Препятствия текущей зоны для коллизий капсулы. */
+  setObstacles(props: PropDef[] | undefined, portals?: any[]): void {
+    this.obstacles = props?.length ? zoneObstacles(props, portals) : [];
+  }
+
   /** Мгновенный перенос (портал): без него предсказание «идёт» через пустоту. */
   teleportTo(x: number, z: number): void {
     this.x = x;
@@ -154,8 +160,26 @@ export class LocalPlayer {
     this.vx = velocity.vx;
     this.vz = velocity.vz;
 
+    const prevX = this.x;
+    const prevZ = this.z;
     this.x += this.vx * dt;
     this.z += this.vz * dt;
+
+    if (this.obstacles.length) {
+      const resolved = resolveCollisions(this.x, this.z, prevX, prevZ, this.obstacles, PLAYER_RADIUS);
+      if (resolved.x !== this.x || resolved.z !== this.z) {
+        const prevVx = this.vx;
+        const prevVz = this.vz;
+        this.x = resolved.x;
+        this.z = resolved.z;
+        const dxHit = this.x - prevX;
+        const dzHit = this.z - prevZ;
+        // Слишком жёстко гасить скорость не надо — иначе дёргается.
+        // Гасим только если толкнули ровно вдоль оси.
+        if (Math.abs(prevVx) > 1e-6 && Math.abs(dxHit) < 1e-4) this.vx = 0;
+        if (Math.abs(prevVz) > 1e-6 && Math.abs(dzHit) < 1e-4) this.vz = 0;
+      }
+    }
 
     // Догоняем ровно на один кадр, но не больше накопленного отставания
     // от авторитета: развернулся — картинка не летит назад через полкарты.
