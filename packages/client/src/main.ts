@@ -34,8 +34,9 @@ import { Input } from './input/Input.ts';
 import { Connection } from './net/Connection.ts';
 import { frameDeltaMs } from './net/frameDelta.ts';
 import { LocalPlayer } from './net/LocalPlayer.ts';
+import { RemotePresentation } from './net/RemotePresentation.ts';
 import { INTERP_DELAY_MS, StateStore } from './net/StateStore.ts';
-import { createAvatar, createNameTag, setNameTag } from './render/avatars.ts';
+import { createAvatar, createNameTag, setAvatarOpacity, setNameTag } from './render/avatars.ts';
 import { createRenderer } from './render/Renderer.ts';
 import { buildPortal, buildZone, disposeGroup } from './render/world.ts';
 import { Hud } from './ui/Hud.ts';
@@ -104,6 +105,7 @@ async function main(): Promise<void> {
 
   const state = new StateStore();
   const connection = new Connection();
+  const remoteView = new RemotePresentation();
 
   let localPlayer: LocalPlayer | null = null;
   let zoneSummaries: ZoneSummary[] = [];
@@ -241,6 +243,7 @@ async function main(): Promise<void> {
       if (state.roster.has(id)) continue;
       disposeGroup(group);
       avatarGroups.delete(id);
+      remoteView.forget(id);
     }
   }
 
@@ -375,7 +378,10 @@ async function main(): Promise<void> {
     onStatus(status: 'connecting' | 'open' | 'closed' | 'error', detail?: string): void {
       hud.setStatus(status, detail);
       if (status === 'open') hud.addChatLine(null, 'соединение установлено');
-      if (status === 'closed') hud.addChatLine(null, 'соединение закрыто');
+      if (status === 'closed') {
+        hud.addChatLine(null, 'соединение закрыто');
+        remoteView.clear();
+      }
       if (status === 'error') hud.addChatLine(null, `ошибка: ${detail ?? '?'}`);
     },
   };
@@ -494,15 +500,17 @@ async function main(): Promise<void> {
     for (const [id, group] of avatarGroups) {
       if (id === state.localPlayerId) continue;
       const entity = snapshot.get(id);
-      if (!entity) {
+      const pose = remoteView.present(id, entity ?? null, now, deltaMs);
+      if (!pose) {
         // Игрок ушёл из зоны или за радиус видимости: сервер перестал
         // слать его состояние. Тело не должно зависнуть на месте — прячем.
         group.visible = false;
         continue;
       }
-      group.visible = true;
-      group.position.set(entity.x, entity.y, entity.z);
-      group.rotation.y = entity.yaw;
+      group.visible = pose.opacity > 0.02;
+      group.position.set(pose.x, pose.y, pose.z);
+      group.rotation.y = pose.yaw;
+      setAvatarOpacity(group, pose.opacity);
     }
 
     // Свой аватар — по предсказанию, а не по интерполированному снимку:

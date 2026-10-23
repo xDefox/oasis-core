@@ -66,6 +66,24 @@ export function createNameTag(name: string, color: number): Sprite {
  * Ростер приходит на каждое подключение и отключение — перерисовывать
  * canvas каждый раз бессмысленно.
  */
+/** Прозрачность аватара (F1-3: fade-in при входе в AOI). */
+export function setAvatarOpacity(group: Group, opacity: number): void {
+  const clamped = Math.min(1, Math.max(0, opacity));
+  group.traverse((child) => {
+    const mesh = child as Mesh;
+    if (!mesh.isMesh) return;
+    const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+    for (const material of materials) {
+      if (!material) continue;
+      const mat = material as MeshStandardMaterial & MeshLambertMaterial & SpriteMaterial;
+      mat.transparent = clamped < 0.999;
+      mat.opacity = clamped;
+      mat.depthWrite = clamped >= 0.999;
+      mat.needsUpdate = true;
+    }
+  });
+}
+
 export function setNameTag(group: Group, name: string, color: number): void {
   const tag = group.getObjectByName('tag') as Sprite | undefined;
   if (!tag) return;
