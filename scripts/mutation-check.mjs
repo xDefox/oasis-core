@@ -107,6 +107,13 @@ const MUTATIONS = [
     expect: 'переименовывает игрока',
   },
   {
+    name: 'потолок кадра срезан до 100 мс (симуляция зависит от fps)',
+    file: 'packages/client/src/net/frameDelta.ts',
+    from: 'export const MAX_FRAME_MS = 400;',
+    to: 'export const MAX_FRAME_MS = 100;',
+    expect: 'не обрезается до 100',
+  },
+  {
     name: 'переименование не рассылает ростер',
     file: 'packages/server/src/rooms/SectorRoom.ts',
     from: '      client.send(S2C.Renamed, { name: next });\n      this.broadcastRoster();',
