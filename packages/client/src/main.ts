@@ -60,6 +60,20 @@ interface Account {
   createdAt: number;
 }
 
+function randomId(): string {
+  // crypto.randomUUID() доступен только в secure context (https или localhost).
+  // В локальной сети по http://<IP>:5173 он отсутствует в некоторых браузерах.
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID().replace(/-/g, '');
+  }
+  if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
+    const bytes = new Uint8Array(16);
+    crypto.getRandomValues(bytes);
+    return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+  }
+  return `${Date.now().toString(36)}${Math.random().toString(36).slice(2)}${Math.random().toString(36).slice(2)}`;
+}
+
 /** Стабильный id аккаунта в localStorage: пока нет серверной авторизации. */
 function loadAccount(): Account {
   const raw = window.localStorage.getItem(ACCOUNT_KEY);
@@ -72,7 +86,7 @@ function loadAccount(): Account {
     }
   }
   const account: Account = {
-    id: `acct_${crypto.randomUUID().replace(/-/g, '')}`,
+    id: `acct_${randomId()}`,
     createdAt: Date.now(),
   };
   window.localStorage.setItem(ACCOUNT_KEY, JSON.stringify(account));
