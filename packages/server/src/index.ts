@@ -38,10 +38,25 @@ async function main(): Promise<void> {
   });
 
   app.get('/stats', async (_request, response) => {
+    let roomMetrics: unknown = null;
+    try {
+      const rooms = (gameServer as any).rooms;
+      if (rooms && typeof rooms.values === 'function') {
+        for (const r of rooms.values()) {
+          if (typeof (r as any).getMetrics === 'function') {
+            roomMetrics = (r as any).getMetrics();
+            break;
+          }
+        }
+      }
+    } catch {
+      // ignore
+    }
     response.json({
       world: { id: world.id, version: world.version, zones: world.zones.length },
       storage: store.kind,
       supply: await store.ledger.totalSupply(world.id),
+      room: roomMetrics,
     });
   });
 

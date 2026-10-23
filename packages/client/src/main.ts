@@ -32,6 +32,7 @@ import {
 
 import { Input } from './input/Input.ts';
 import { Connection } from './net/Connection.ts';
+import { frameDeltaMs } from './net/frameDelta.ts';
 import { LocalPlayer } from './net/LocalPlayer.ts';
 import { INTERP_DELAY_MS, StateStore } from './net/StateStore.ts';
 import { createAvatar, createNameTag, setNameTag } from './render/avatars.ts';
@@ -459,7 +460,7 @@ async function main(): Promise<void> {
     frameCounter += 1;
 
     const now = performance.now();
-    const deltaMs = Math.min(now - lastFrame, 100);
+    const deltaMs = frameDeltaMs(now, lastFrame);
     lastFrame = now;
 
     // 1. ввод

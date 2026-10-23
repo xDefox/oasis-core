@@ -118,14 +118,21 @@ await alpha.bringToFront();
 await waitForTicks(alpha, 5);
 const atWallStart = await debug(alpha);
 
-// Отходим по z: yaw = 0, значит S = +Z. 30 тиков = 1.5 с симуляции ≈ 7 м:
-// хватает, чтобы уйти от портала, и не зависит от fps.
+// Отходим по z: yaw = 0, значит S = +Z. Ноги должны пройти не меньше 5 м,
+// чтобы портал (26, 0, радиус 3) не перехватил движение вправо. 45 тиков =
+// 2.25 с симуляции ≈ 11 м — с запасом. Прежние 30 тиков давали ~7.5 м и
+// проверка падала на живом коде: от W мы уже ушли на ~7 м в минус по z.
 await alpha.keyboard.down('KeyS');
-await waitForTicks(alpha, 30);
+const retreatTicks = await waitForTicks(alpha, 45);
 await alpha.keyboard.up('KeyS');
 await waitForTicks(alpha, 5);
 const aside = await debug(alpha);
-console.log('отошли от портала:', { x: aside.x, z: aside.z, зона: aside.zone?.id });
+console.log('отошли от портала:', {
+  x: aside.x,
+  z: aside.z,
+  зона: aside.zone?.id,
+  тиков: retreatTicks,
+});
 
 if (Math.abs(aside.z) < 5) {
   problems.add(`не удалось отойти от портала по z: z=${aside.z} (нужно |z| > 5)`);
