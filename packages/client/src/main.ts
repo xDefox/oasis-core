@@ -60,6 +60,22 @@ interface Account {
   createdAt: number;
 }
 
+function randomId(): string {
+  // crypto.randomUUID() доступен только в secure context (https или localhost).
+  // В локальной сети по http://<IP>:5173 он отсутствует в некоторых браузерах.
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID().replace(/-/g, '');
+  }
+  if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
+    const bytes = new Uint8Array(16);
+    crypto.getRandomValues(bytes);
+    // Упрощённый UUID-подобный hex без строгой RFC-версии — достаточно для acct_*
+    return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+  }
+  // Крайний фоллбэк на случай совсем древнего окружения.
+  return `${Date.now().toString(36)}${Math.random().toString(36).slice(2)}${Math.random().toString(36).slice(2)}`;
+}
+
 /** Стабильный id аккаунта в localStorage: пока нет серверной авторизации. */
 function loadAccount(): Account {
   const raw = window.localStorage.getItem(ACCOUNT_KEY);
@@ -72,7 +88,7 @@ function loadAccount(): Account {
     }
   }
   const account: Account = {
-    id: `acct_${crypto.randomUUID().replace(/-/g, '')}`,
+    id: `acct_${randomId()}`,
     createdAt: Date.now(),
   };
   window.localStorage.setItem(ACCOUNT_KEY, JSON.stringify(account));
@@ -269,6 +285,7 @@ async function main(): Promise<void> {
       const zone = zoneAt(message.spawn.x, message.spawn.z);
       if (zone) {
         localPlayer.setBounds(zone.bounds);
+        // zone.props нет в ZoneSummary — границы загрузим вместе с геометрией зоны
         requestZone(zone.id);
       }
     },
@@ -307,10 +324,13 @@ async function main(): Promise<void> {
         : zone.id;
       unloadZonesExcept(keepId);
 
-      // Если игрок уже в этой зоне — обновляем границы предсказания.
+      // Если игрок уже в этой зоне — обновляем границы предсказания и препятствия.
       if (localPlayer) {
         const at = zoneAt(localPlayer.x, localPlayer.z);
-        if (at?.id === zone.id) localPlayer.setBounds(zone.bounds);
+        if (at?.id === zone.id) {
+          localPlayer.setBounds(zone.bounds);
+          localPlayer.setObstacles(zone.props);
+        }
       }
     },
 
@@ -320,6 +340,7 @@ async function main(): Promise<void> {
       const zone = zoneSummaries.find((candidate) => candidate.id === message.zoneId);
       if (localPlayer) {
         localPlayer.setBounds(zone?.bounds ?? null);
+        localPlayer.setObstacles(undefined);
         localPlayer.teleportTo(message.position.x, message.position.z);
       }
       // Старую геометрию снимаем сразу: иначе после нескольких порталов
