@@ -307,10 +307,13 @@ async function main(): Promise<void> {
         : zone.id;
       unloadZonesExcept(keepId);
 
-      // Если игрок уже в этой зоне — обновляем границы предсказания.
+      // Если игрок уже в этой зоне — обновляем границы предсказания и препятствия.
       if (localPlayer) {
         const at = zoneAt(localPlayer.x, localPlayer.z);
-        if (at?.id === zone.id) localPlayer.setBounds(zone.bounds);
+        if (at?.id === zone.id) {
+          localPlayer.setBounds(zone.bounds);
+          localPlayer.setObstacles(zone.props, worldPortals);
+        }
       }
     },
 
@@ -320,6 +323,7 @@ async function main(): Promise<void> {
       const zone = zoneSummaries.find((candidate) => candidate.id === message.zoneId);
       if (localPlayer) {
         localPlayer.setBounds(zone?.bounds ?? null);
+        localPlayer.setObstacles(undefined);
         localPlayer.teleportTo(message.position.x, message.position.z);
       }
       // Старую геометрию снимаем сразу: иначе после нескольких порталов

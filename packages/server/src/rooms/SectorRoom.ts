@@ -34,8 +34,11 @@ import {
   encodeDelta,
   encodeSnapshot,
   isProtocolCompatible,
+  resolveCollisions,
   speedOf,
   stepVelocity,
+  zoneObstacles,
+  type CircleObstacle,
   type EntityState,
   type HelloMsg,
   type PlayerInfo,
@@ -140,6 +143,8 @@ export class SectorRoom extends Room {
   private bytesOutWindow: number[] = [];
   private lastByteWindowAt = Date.now();
   private readonly maxTickDurations = 2000;
+  // Препятствия по зонам — кэш, строится при первом обращении.
+  private obstaclesByZone = new Map<string, CircleObstacle[]>();
 
   override onCreate(options: SectorRoomOptions): void {
     this.world = options.world;
@@ -472,9 +477,32 @@ export class SectorRoom extends Room {
       session.vx = velocity.vx;
       session.vz = velocity.vz;
 
+      const beforeMoveX = session.x;
+      const beforeMoveZ = session.z;
       session.x += session.vx * dt;
       session.z += session.vz * dt;
       if (input) session.yaw = input.yaw;
+
+      // Столкновения с пропсами — общая формула с клиентом.
+      const zoneMove = zoneAt(this.world, session.x, session.z);
+      if (zoneMove) {
+        let obs = this.obstaclesByZone.get(zoneMove.id);
+        if (!obs) {
+          obs = zoneObstacles(zoneMove.props, this.world.portals);
+          this.obstaclesByZone.set(zoneMove.id, obs);
+        }
+        const prevVx = session.vx;
+        const prevVz = session.vz;
+        const resolved = resolveCollisions(session.x, session.z, beforeMoveX, beforeMoveZ, obs);
+        if (resolved.x !== session.x || resolved.z !== session.z) {
+          session.x = resolved.x;
+          session.z = resolved.z;
+          const dxHit = session.x - beforeMoveX;
+          const dzHit = session.z - beforeMoveZ;
+          if (Math.abs(prevVx) > 1e-6 && Math.abs(dxHit) < 1e-4) session.vx = 0;
+          if (Math.abs(prevVz) > 1e-6 && Math.abs(dzHit) < 1e-4) session.vz = 0;
+        }
+      }
 
       // Зона и порталы проверяются всегда, даже без ввода: игрок может
       // стоять внутри портала, а после телепорта его позицию нужно
