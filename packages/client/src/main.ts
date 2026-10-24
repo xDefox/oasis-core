@@ -36,10 +36,11 @@ import { frameDeltaMs } from './net/frameDelta.ts';
 import { LocalPlayer } from './net/LocalPlayer.ts';
 import { RemotePresentation } from './net/RemotePresentation.ts';
 import { INTERP_DELAY_MS, StateStore } from './net/StateStore.ts';
-import { createAvatar, createNameTag, setAvatarOpacity, setNameTag } from './render/avatars.ts';
+import { animateAvatar, createAvatar, createNameTag, setAvatarOpacity, setNameTag } from './render/avatars.ts';
 import { createRenderer } from './render/Renderer.ts';
 import { buildPortal, buildZone, disposeGroup } from './render/world.ts';
 import { Hud } from './ui/Hud.ts';
+import { runOnboarding } from './ui/Onboarding.ts';
 
 /** На HTTPS-странице ws:// блокируется браузером как mixed content. */
 const SERVER_URL =
@@ -400,9 +401,13 @@ async function main(): Promise<void> {
     },
   };
 
-  // ── подключение ────────────────────────────────────────────────────────
+  // ── онбординг (F1-8) → подключение ─────────────────────────────────────
 
   const account = loadAccount();
+  const gate = await runOnboarding(loadName());
+  if (gate.shown) saveName(gate.name);
+  const joinName = gate.name;
+
   try {
     await connection.connect(
       SERVER_URL,
@@ -410,7 +415,7 @@ async function main(): Promise<void> {
         protocolVersion: PROTOCOL_VERSION,
         accountId: account.id,
         accountCreatedAt: account.createdAt,
-        name: loadName(),
+        name: joinName,
       },
       handlers,
     );
@@ -525,6 +530,15 @@ async function main(): Promise<void> {
       group.position.set(pose.x, pose.y, pose.z);
       group.rotation.y = pose.yaw;
       setAvatarOpacity(group, pose.opacity);
+      // Скорость чужого — по смещению сглаженной позы между кадрами.
+      const prev = (group.userData.prevPos as { x: number; z: number } | undefined) ?? {
+        x: pose.x,
+        z: pose.z,
+      };
+      const moved = Math.hypot(pose.x - prev.x, pose.z - prev.z);
+      const speed = deltaMs > 0 ? (moved / deltaMs) * 1000 : 0;
+      group.userData.prevPos = { x: pose.x, z: pose.z };
+      animateAvatar(group, speed, deltaMs);
     }
 
     // Свой аватар — по предсказанию, а не по интерполированному снимку:
@@ -536,6 +550,7 @@ async function main(): Promise<void> {
       if (own) {
         own.position.set(localPlayer.renderX, 0, localPlayer.renderZ);
         own.rotation.y = input.yaw;
+        animateAvatar(own, Math.hypot(localPlayer.vx, localPlayer.vz), deltaMs);
       }
     }
 
