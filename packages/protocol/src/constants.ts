@@ -6,7 +6,7 @@
  * Любое изменение здесь ломает предсказание → требует bump PROTOCOL_VERSION.
  */
 
-export const PROTOCOL_VERSION = '0.2.0';
+export const PROTOCOL_VERSION = '0.5.0';
 
 /** Частота серверной симуляции, Гц. */
 export const TICK_RATE = 20;
@@ -24,12 +24,23 @@ export const POSITION_QUANT = 64;
 
 /** Скорости, м/с. 5 м/с ≈ 18 км/ч — это бег, а не прогулка. */
 export const PLAYER_SPEED = 5.0;
-export const PLAYER_SPRINT_SPEED = 8.0;
+export const PLAYER_SPRINT_SPEED = 9.5;
+/** Присед: медленный шаг вприсядку. */
+export const PLAYER_CROUCH_SPEED = 2.2;
 export const PLAYER_RADIUS = 0.4;
+/** Высота тела для отбора горизонтальных коллайдеров, м. */
+export const PLAYER_HEIGHT = 1.7;
+/** Высота тела в приседе (для коллизий с низкими проёмами позже). */
+export const PLAYER_CROUCH_HEIGHT = 1.05;
 /** Разгон, м/с²: 0 → 5 м/с за 0.18 с. */
 export const PLAYER_ACCEL = 28.0;
 /** Торможение, м/с²: останавливаемся быстрее, чем разгоняемся. */
 export const PLAYER_DECEL = 42.0;
+
+/** Прыжок: пол y=0, без платформ. Высота ≈ v²/(2g) ≈ 1.1 м. */
+export const PLAYER_GRAVITY = 24.0;
+export const PLAYER_JUMP_SPEED = 7.2;
+export const GROUND_Y = 0;
 
 /** Ограничения чата. */
 export const MAX_CHAT_LENGTH = 240;
@@ -86,4 +97,7 @@ export const ENTITY_FLAG = {
   Moving: 1 << 0,
   Sprinting: 1 << 1,
   Speaking: 1 << 2,
+  Crouching: 1 << 3,
+  /** В воздухе (прыжок / падение). */
+  Airborne: 1 << 4,
 } as const;
