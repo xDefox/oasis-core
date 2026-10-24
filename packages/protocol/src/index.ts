@@ -14,3 +14,4 @@ export * from './domain.ts';
 export * from './types.ts';
 export * from './codec.ts';
 export * from './movement.ts';
+export * from './collision.ts';

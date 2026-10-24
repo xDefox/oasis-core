@@ -16,8 +16,10 @@ import { Group, Raycaster, Vector3 } from 'three/webgpu';
 
 import {
   BIN,
+  ENTITY_FLAG,
   INPUT_RATE,
   PROTOCOL_VERSION,
+  buildZoneColliders,
   decodeDelta,
   decodeSnapshot,
   type ChatBroadcastMsg,
@@ -34,23 +36,31 @@ import { Input } from './input/Input.ts';
 import { Connection } from './net/Connection.ts';
 import { frameDeltaMs } from './net/frameDelta.ts';
 import { LocalPlayer } from './net/LocalPlayer.ts';
+import { RemotePresentation } from './net/RemotePresentation.ts';
 import { INTERP_DELAY_MS, StateStore } from './net/StateStore.ts';
-import { createAvatar, createNameTag, setNameTag } from './render/avatars.ts';
+import { animateAvatar, createAvatar, createNameTag, setAvatarOpacity, setNameTag } from './render/avatars.ts';
 import { createRenderer } from './render/Renderer.ts';
 import { buildPortal, buildZone, disposeGroup } from './render/world.ts';
 import { Hud } from './ui/Hud.ts';
+import { runOnboarding } from './ui/Onboarding.ts';
 
 /** На HTTPS-странице ws:// блокируется браузером как mixed content. */
 const SERVER_URL =
   (import.meta.env.VITE_SERVER_URL as string | undefined) ??
   `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.hostname}:2567`;
 
-/** Камера от третьего лица: на сколько метров позади игрока. */
+/** Камера от третьего лица: дистанция по умолчанию / зум колёсиком. */
 const CAMERA_DISTANCE = 4.2;
+const CAMERA_DISTANCE_MIN = 1.6;
+const CAMERA_DISTANCE_MAX = 7.5;
 /** Ближе этого к игроку камеру не прижимаем — иначе видно изнутри капсулы. */
-const CAMERA_MIN_DISTANCE = 0.9;
+const CAMERA_MIN_DISTANCE = 0.85;
+/** Зазор между камерой и поверхностью пропа при антиклипе, м. */
+const CAMERA_CLIP_PADDING = 0.28;
+/** Минимальная высота камеры над ногами игрока (не уходить под пол). */
+const CAMERA_FLOOR_CLEARANCE = 0.35;
 /** Высота точки, на которую смотрит камера. */
-const CAMERA_TARGET_HEIGHT = 1.4;
+const CAMERA_TARGET_HEIGHT = 1.55;
 
 const ACCOUNT_KEY = 'oasis.account';
 const NAME_KEY = 'oasis.name';
@@ -118,6 +128,7 @@ async function main(): Promise<void> {
 
   const state = new StateStore();
   const connection = new Connection();
+  const remoteView = new RemotePresentation();
 
   let localPlayer: LocalPlayer | null = null;
   let zoneSummaries: ZoneSummary[] = [];
@@ -175,9 +186,13 @@ async function main(): Promise<void> {
     hud.addChatLine(null, `неизвестная команда «${rawCommand}» — /help`);
   }
 
-  const input = new Input(canvas, (locked) => {
-    hud.setCrosshair(locked);
-  });
+  const input = new Input(
+    canvas,
+    (locked) => {
+      hud.setCrosshair(locked);
+    },
+    { default: CAMERA_DISTANCE, min: CAMERA_DISTANCE_MIN, max: CAMERA_DISTANCE_MAX },
+  );
 
   // ── зоны ────────────────────────────────────────────────────────────────
 
@@ -255,6 +270,7 @@ async function main(): Promise<void> {
       if (state.roster.has(id)) continue;
       disposeGroup(group);
       avatarGroups.delete(id);
+      remoteView.forget(id);
     }
   }
 
@@ -272,7 +288,10 @@ async function main(): Promise<void> {
       } else {
         hud.addChatLine(null, `ты в мире как «${message.name}»`);
       }
-      hud.addChatLine(null, 'WASD — идти, Shift — бежать, мышь — камера, Enter — чат');
+      hud.addChatLine(
+        null,
+        'WASD — идти, Shift — бежать, Ctrl — присесть, Space — прыжок, мышь — камера, Enter — чат',
+      );
       state.localPlayerId = message.playerId;
       zoneSummaries = message.world.zones;
       worldPortals = message.world.portals ?? [];
@@ -321,16 +340,18 @@ async function main(): Promise<void> {
         : zone.id;
       unloadZonesExcept(keepId);
 
-      // Если игрок уже в этой зоне — обновляем границы предсказания.
+      // Коллизии предсказания = те же пропы, что рисуем (F1-1).
       if (localPlayer) {
         const at = zoneAt(localPlayer.x, localPlayer.z);
-        if (at?.id === zone.id) localPlayer.setBounds(zone.bounds);
+        if (at?.id === zone.id) {
+          localPlayer.setColliders(buildZoneColliders(zone));
+        }
       }
     },
 
     onTeleport(message: TeleportMsg): void {
-      // Сначала границы новой зоны, потом мгновенный перенос: иначе clamp
-      // старой зоны «дёрнет» предсказание до того, как мы узнаем, куда едем.
+      // Сначала границы новой зоны (без старых коллайдеров), потом перенос:
+      // иначе clamp старой зоны «дёрнет» предсказание. Пропы придут в onZone.
       const zone = zoneSummaries.find((candidate) => candidate.id === message.zoneId);
       if (localPlayer) {
         localPlayer.setBounds(zone?.bounds ?? null);
@@ -389,14 +410,21 @@ async function main(): Promise<void> {
     onStatus(status: 'connecting' | 'open' | 'closed' | 'error', detail?: string): void {
       hud.setStatus(status, detail);
       if (status === 'open') hud.addChatLine(null, 'соединение установлено');
-      if (status === 'closed') hud.addChatLine(null, 'соединение закрыто');
+      if (status === 'closed') {
+        hud.addChatLine(null, 'соединение закрыто');
+        remoteView.clear();
+      }
       if (status === 'error') hud.addChatLine(null, `ошибка: ${detail ?? '?'}`);
     },
   };
 
-  // ── подключение ────────────────────────────────────────────────────────
+  // ── онбординг (F1-8) → подключение ─────────────────────────────────────
 
   const account = loadAccount();
+  const gate = await runOnboarding(loadName());
+  if (gate.shown) saveName(gate.name);
+  const joinName = gate.name;
+
   try {
     await connection.connect(
       SERVER_URL,
@@ -404,7 +432,7 @@ async function main(): Promise<void> {
         protocolVersion: PROTOCOL_VERSION,
         accountId: account.id,
         accountCreatedAt: account.createdAt,
-        name: loadName(),
+        name: joinName,
       },
       handlers,
     );
@@ -446,11 +474,12 @@ async function main(): Promise<void> {
   const rayHit = new Vector3();
   const raycaster = new Raycaster();
   let cameraSmoothedDistance = CAMERA_DISTANCE;
+  /** Сглаженная высота камеры при приседе — без рывка вниз. */
+  let cameraCrouchDrop = 0;
 
   /**
-   * Максимальное расстояние от цели до камеры вдоль направления взгляда.
-   * Луч пускаем из точки взгляда: если начать из центра капсулы, рейкаст
-   * поймает саму капсулу игрока и камера встанет вплотную к лицу.
+   * F1-5: максимальная дистанция камеры до стены/пропа.
+   * Пол (`isGround`) пропускаем — под полом держим отдельным clamp по Y.
    */
   function clampCameraDistance(target: Vector3, desired: Vector3): number {
     rayDirection.copy(desired).sub(target);
@@ -462,11 +491,20 @@ async function main(): Promise<void> {
     raycaster.far = distance;
 
     const hits = raycaster.intersectObjects([...zoneGroups.values()], true);
-    const hit = hits[0];
-    if (!hit) return distance;
-
-    rayHit.copy(hit.point);
-    return Math.max(CAMERA_MIN_DISTANCE, target.distanceTo(rayHit) - 0.25);
+    for (const hit of hits) {
+      let obj: { userData?: { isGround?: boolean }; parent?: unknown } | null = hit.object;
+      let ground = false;
+      while (obj) {
+        if (obj.userData?.isGround) {
+          ground = true;
+          break;
+        }
+        obj = obj.parent as typeof obj;
+      }
+      if (ground) continue;
+      return Math.max(CAMERA_MIN_DISTANCE, hit.distance - CAMERA_CLIP_PADDING);
+    }
+    return distance;
   }
 
   function frame(): void {
@@ -479,7 +517,15 @@ async function main(): Promise<void> {
 
     // 1. ввод
     const direction = input.moveDirection();
-    localPlayer?.setDirection(direction.x, direction.z, input.sprinting);
+    const jump = input.consumeJump();
+    localPlayer?.setDirection(
+      direction.x,
+      direction.z,
+      input.sprinting,
+      input.crouching,
+      jump,
+    );
+    const netJump = Boolean(localPlayer?.jumpPending);
 
     // 2. предсказание
     localPlayer?.advance(deltaMs);
@@ -497,6 +543,8 @@ async function main(): Promise<void> {
           dirZ: direction.z,
           yaw: input.yaw,
           sprint: input.sprinting,
+          crouch: input.crouching,
+          jump: netJump,
         });
       }
     }
@@ -508,15 +556,32 @@ async function main(): Promise<void> {
     for (const [id, group] of avatarGroups) {
       if (id === state.localPlayerId) continue;
       const entity = snapshot.get(id);
-      if (!entity) {
+      const pose = remoteView.present(id, entity ?? null, now, deltaMs);
+      if (!pose) {
         // Игрок ушёл из зоны или за радиус видимости: сервер перестал
         // слать его состояние. Тело не должно зависнуть на месте — прячем.
         group.visible = false;
         continue;
       }
-      group.visible = true;
-      group.position.set(entity.x, entity.y, entity.z);
-      group.rotation.y = entity.yaw;
+      group.visible = pose.opacity > 0.02;
+      group.position.set(pose.x, pose.y, pose.z);
+      // Модель смотрит в +Z, камера и «вперёд» — в −Z: +π, чтобы видеть спину.
+      group.rotation.y = pose.yaw + Math.PI;
+      setAvatarOpacity(group, pose.opacity);
+      // Скорость чужого — по смещению сглаженной позы между кадрами.
+      const prev = (group.userData.prevPos as { x: number; z: number } | undefined) ?? {
+        x: pose.x,
+        z: pose.z,
+      };
+      const moved = Math.hypot(pose.x - prev.x, pose.z - prev.z);
+      const speed = deltaMs > 0 ? (moved / deltaMs) * 1000 : 0;
+      group.userData.prevPos = { x: pose.x, z: pose.z };
+      const flags = entity?.flags ?? 0;
+      animateAvatar(group, speed, deltaMs, {
+        sprint: (flags & ENTITY_FLAG.Sprinting) !== 0,
+        crouch: (flags & ENTITY_FLAG.Crouching) !== 0,
+        airborne: (flags & ENTITY_FLAG.Airborne) !== 0 || pose.y > 0.05,
+      });
     }
 
     // Свой аватар — по предсказанию, а не по интерполированному снимку:
@@ -526,13 +591,17 @@ async function main(): Promise<void> {
     if (localPlayer) {
       const own = avatarGroups.get(state.localPlayerId);
       if (own) {
-        own.position.set(localPlayer.renderX, 0, localPlayer.renderZ);
-        own.rotation.y = input.yaw;
+        own.position.set(localPlayer.renderX, localPlayer.renderY, localPlayer.renderZ);
+        own.rotation.y = input.yaw + Math.PI;
+        animateAvatar(own, Math.hypot(localPlayer.vx, localPlayer.vz), deltaMs, {
+          sprint: localPlayer.sprinting,
+          crouch: localPlayer.crouching && localPlayer.grounded,
+          airborne: localPlayer.airborne,
+        });
       }
     }
 
-    // Камера: вид от третьего лица. Сглаживание — по времени, а не по кадрам,
-    // иначе на 144 Гц камера «прилипает» быстрее, чем на 60.
+    // F1-5: цель на игроке, антиклип рейкастом, плавный зум, пол по Y.
     if (localPlayer) {
       const pitch = input.pitch;
       const yaw = input.yaw;
@@ -541,25 +610,34 @@ async function main(): Promise<void> {
         Math.sin(pitch),
         -Math.cos(yaw) * Math.cos(pitch),
       );
-      cameraTarget.set(localPlayer.renderX, CAMERA_TARGET_HEIGHT, localPlayer.renderZ);
-      cameraPosition.copy(cameraTarget).addScaledVector(lookDirection, -CAMERA_DISTANCE);
+      cameraCrouchDrop +=
+        ((localPlayer.crouching && localPlayer.grounded ? 0.38 : 0) - cameraCrouchDrop) *
+        (1 - Math.exp(-deltaMs / 70));
+      cameraTarget.set(
+        localPlayer.renderX,
+        CAMERA_TARGET_HEIGHT - cameraCrouchDrop + localPlayer.renderY,
+        localPlayer.renderZ,
+      );
 
-      // Прижимаем камеру к стене: если между ней и игроком что-то есть,
-      // ставим её ближе, иначе она смотрит из-за стены на пустой мир.
+      const desiredDistance = input.cameraDistance;
+      cameraPosition.copy(cameraTarget).addScaledVector(lookDirection, -desiredDistance);
+
       const clamped = clampCameraDistance(cameraTarget, cameraPosition);
-      if (clamped < CAMERA_DISTANCE - 0.01) {
-        // Вылезли из стены — принимаем новое расстояние мгновенно,
-        // иначе камера проезжает сквозь препятствие.
-        const direction = cameraPosition.clone().sub(cameraTarget).normalize();
-        camera.position.copy(cameraTarget).addScaledVector(direction, clamped);
+      if (clamped < cameraSmoothedDistance - 0.02) {
+        // В стену — сразу, иначе кадр изнутри пропа.
         cameraSmoothedDistance = clamped;
       } else {
-        // Обратно отъезжаем плавно, иначе камера дёргается на каждом углу.
-        cameraSmoothedDistance += (clamped - cameraSmoothedDistance) * (1 - Math.exp(-deltaMs / 90));
-        const direction = cameraPosition.clone().sub(cameraTarget).normalize();
-        camera.position.copy(cameraTarget).addScaledVector(direction, cameraSmoothedDistance);
+        // От стены / к зуму колёсика — плавно.
+        const zoomTarget = Math.min(desiredDistance, clamped);
+        cameraSmoothedDistance +=
+          (zoomTarget - cameraSmoothedDistance) * (1 - Math.exp(-deltaMs / 140));
+        if (clamped < cameraSmoothedDistance) cameraSmoothedDistance = clamped;
       }
 
+      camera.position.copy(cameraTarget).addScaledVector(lookDirection, -cameraSmoothedDistance);
+      // Не проваливаться под пол за спиной при взгляде вверх.
+      const floorY = localPlayer.renderY + CAMERA_FLOOR_CLEARANCE;
+      if (camera.position.y < floorY) camera.position.y = floorY;
       camera.lookAt(cameraTarget);
     }
 

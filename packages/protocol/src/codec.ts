@@ -240,7 +240,7 @@ export const SNAPSHOT_HEADER_BYTES = HEADER_BYTES;
  *   i16  dirX * 1000   (направление в мировых координатах, ±1.0)
  *   i16  dirZ * 1000
  *   u16  yaw (0..65535 → 0..2π)
- *   u8   flags (bit0 = sprint)
+ *   u8   flags (bit0 = sprint, bit1 = crouch, bit2 = jump)
  */
 export function encodeInput(input: {
   seq: number;
@@ -248,6 +248,8 @@ export function encodeInput(input: {
   dirZ: number;
   yaw: number;
   sprint: boolean;
+  crouch?: boolean;
+  jump?: boolean;
 }): Uint8Array {
   const writer = new ByteWriter(1 + 4 + 2 + 2 + 2 + 1);
   writer.u8(BIN.Input);
@@ -255,7 +257,11 @@ export function encodeInput(input: {
   writer.i16(Math.round(input.dirX * 1000));
   writer.i16(Math.round(input.dirZ * 1000));
   writer.u16(quantizeYaw(input.yaw));
-  writer.u8(input.sprint ? 1 : 0);
+  let flags = 0;
+  if (input.sprint) flags |= 1;
+  if (input.crouch) flags |= 2;
+  if (input.jump) flags |= 4;
+  writer.u8(flags);
   return writer.bytes();
 }
 
@@ -265,6 +271,8 @@ export function decodeInput(data: Uint8Array): {
   dirZ: number;
   yaw: number;
   sprint: boolean;
+  crouch: boolean;
+  jump: boolean;
 } {
   const reader = new ByteReader(data);
   const type = reader.u8();
@@ -275,6 +283,14 @@ export function decodeInput(data: Uint8Array): {
   const dirX = reader.i16() / 1000;
   const dirZ = reader.i16() / 1000;
   const yaw = dequantizeYaw(reader.u16());
-  const sprint = reader.u8() === 1;
-  return { seq, dirX, dirZ, yaw, sprint };
+  const flags = reader.u8();
+  return {
+    seq,
+    dirX,
+    dirZ,
+    yaw,
+    sprint: (flags & 1) !== 0,
+    crouch: (flags & 2) !== 0,
+    jump: (flags & 4) !== 0,
+  };
 }
