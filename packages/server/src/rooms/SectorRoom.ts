@@ -26,21 +26,27 @@ import {
   GENESIS_ACCOUNT_MIN_AGE_MS,
   GENESIS_FRESH_ACCOUNT_FACTOR,
   GENESIS_GRANT,
+  PLAYER_RADIUS,
   PROTOCOL_VERSION,
   S2C,
   SNAPSHOT_RATE,
   TICK_RATE,
+  buildZoneColliders,
+  clampToBounds,
   decodeInput,
   encodeDelta,
   encodeSnapshot,
   isProtocolCompatible,
+  resolvePlayerMove,
   speedOf,
   stepVelocity,
+  stepVertical,
   type EntityState,
   type HelloMsg,
   type PlayerInfo,
   type WelcomeMsg,
   type WorldDef,
+  type ZoneColliders,
 } from '@oasis/protocol';
 import {
   chatSchema,
@@ -62,6 +68,8 @@ interface SessionInput {
   dirZ: number;
   yaw: number;
   sprint: boolean;
+  crouch: boolean;
+  jump: boolean;
 }
 
 interface Session {
@@ -79,6 +87,8 @@ interface Session {
   yaw: number;
   moving: boolean;
   sprinting: boolean;
+  crouching: boolean;
+  airborne: boolean;
   input: SessionInput | null;
   /** Что клиент уже получил — по этому состоянию считаем диффы. */
   sent: Map<number, EntityState>;
@@ -89,6 +99,7 @@ interface Session {
   teleportUntil: number;
   /** Скорость в м/с: разгон и торможение живут на сервере, клиент их повторяет. */
   vx: number;
+  vy: number;
   vz: number;
   /** Когда пришёл последний ввод — по нему считаем TTL. */
   lastInputAt: number;
@@ -131,6 +142,8 @@ export class SectorRoom extends Room {
    */
   private readonly genesisInFlight = new Map<string, Promise<number>>();
   private readonly entities = new Map<number, EntityState>();
+  /** Коллайдеры пропов по зонам — собираются один раз при создании комнаты. */
+  private readonly zoneColliders = new Map<string, ZoneColliders>();
   private nextEntityId = 1;
   private tick = 0;
 
@@ -147,6 +160,11 @@ export class SectorRoom extends Room {
     this.maxPlayers = options.maxPlayers ?? 64;
     // Matchmaking должен отказывать сам, а не пускать и потом выкидывать.
     this.maxClients = this.maxPlayers;
+
+    this.zoneColliders.clear();
+    for (const zone of this.world.zones) {
+      this.zoneColliders.set(zone.id, buildZoneColliders(zone));
+    }
 
     this.setFixedTimestep((context) => this.simulate(context.dt), TICK_RATE);
     this.clock.setInterval(() => this.publish(), Math.round(1000 / SNAPSHOT_RATE));
@@ -176,7 +194,15 @@ export class SectorRoom extends Room {
       // JSON-ввод — запасной путь (например, для отладки и тестов без бинаря).
       const session = this.sessions.get(client.sessionId);
       if (!session) return;
-      session.input = message;
+      session.input = {
+        seq: message.seq,
+        dirX: message.dirX,
+        dirZ: message.dirZ,
+        yaw: message.yaw,
+        sprint: message.sprint,
+        crouch: message.crouch ?? false,
+        jump: message.jump ?? false,
+      };
       session.yaw = message.yaw;
       session.lastInputAt = Date.now();
     });
@@ -364,12 +390,15 @@ export class SectorRoom extends Room {
       yaw: 0,
       moving: false,
       sprinting: false,
+      crouching: false,
+      airborne: false,
       input: null,
       sent: new Map(),
       chatTimestamps: [],
       balance: 0,
       zoneId: null,
       vx: 0,
+      vy: 0,
       vz: 0,
       teleportUntil: 0,
       lastInputAt: 0,
@@ -466,32 +495,37 @@ export class SectorRoom extends Room {
 
       const dirX = input?.dirX ?? 0;
       const dirZ = input?.dirZ ?? 0;
-      const sprint = input?.sprint ?? false;
+      const crouch = input?.crouch ?? false;
+      const sprint = !crouch && (input?.sprint ?? false);
+      const wantJump = input?.jump ?? false;
 
-      const velocity = stepVelocity(session.vx, session.vz, dirX, dirZ, sprint, dt);
+      const velocity = stepVelocity(session.vx, session.vz, dirX, dirZ, sprint, dt, crouch);
       session.vx = velocity.vx;
       session.vz = velocity.vz;
 
+      const prevX = session.x;
+      const prevZ = session.z;
       session.x += session.vx * dt;
       session.z += session.vz * dt;
       if (input) session.yaw = input.yaw;
 
-      // Зона и порталы проверяются всегда, даже без ввода: игрок может
-      // стоять внутри портала, а после телепорта его позицию нужно
-      // разослать, не дожидаясь следующего нажатия.
-      const beforeX = session.x;
-      const beforeZ = session.z;
-      this.clampToZone(session);
-      // Упёрлись в границу — гасим скорость в эту сторону, иначе игрок
-      // продолжает «давить» в стену и после отпускания клавиши.
-      if (session.x !== beforeX) session.vx = 0;
-      if (session.z !== beforeZ) session.vz = 0;
+      // Коллизии с пропами + край зоны (с радиусом). Та же формула, что
+      // на клиенте в LocalPlayer — иначе предсказание резинит.
+      this.resolveMotion(session, session.x - prevX, session.z - prevZ);
 
+      const vertical = stepVertical(session.y, session.vy, wantJump, crouch, dt);
+      session.y = vertical.y;
+      session.vy = vertical.vy;
+      session.airborne = !vertical.grounded;
+
+      // Порталы проверяются всегда, даже без ввода: игрок может стоять
+      // внутри портала, а после телепорта позицию нужно разослать.
       this.checkPortal(session);
 
       const speed = speedOf(session.vx, session.vz);
       session.moving = speed > 0.2;
-      session.sprinting = session.moving && sprint;
+      session.crouching = crouch && vertical.grounded;
+      session.sprinting = session.moving && sprint && vertical.grounded;
 
       const entity = this.entities.get(session.entityId);
       if (entity) {
@@ -501,7 +535,9 @@ export class SectorRoom extends Room {
         entity.yaw = session.yaw;
         entity.flags =
           (session.moving ? ENTITY_FLAG.Moving : 0) |
-          (session.sprinting ? ENTITY_FLAG.Sprinting : 0);
+          (session.sprinting ? ENTITY_FLAG.Sprinting : 0) |
+          (session.crouching ? ENTITY_FLAG.Crouching : 0) |
+          (session.airborne ? ENTITY_FLAG.Airborne : 0);
       }
     }
     const dtMs = performance.now() - t0;
@@ -563,15 +599,36 @@ export class SectorRoom extends Room {
     return `${base} ${Date.now().toString(36)}`;
   }
 
-  /** Игрок не может выйти за пределы зоны сектора. */
-  private clampToZone(session: Session): void {
-    const zone = zoneAt(this.world, session.x, session.z);
-    if (!zone) return;
-    const halfW = zone.bounds.w / 2;
-    const halfD = zone.bounds.d / 2;
-    session.x = Math.min(Math.max(session.x, zone.bounds.x - halfW), zone.bounds.x + halfW);
-    session.z = Math.min(Math.max(session.z, zone.bounds.z - halfD), zone.bounds.z + halfD);
-    session.zoneId = zone.id;
+  /**
+   * Разрешает шаг против пропов текущей зоны и прижимает к bounds.
+   * Обновляет zoneId по фактической точке (как старый clampToZone).
+   */
+  private resolveMotion(session: Session, dx: number, dz: number): void {
+    const zone = zoneAt(this.world, session.x, session.z) ?? (session.zoneId
+      ? findZone(this.world, session.zoneId)
+      : undefined);
+    const startX = session.x - dx;
+    const startZ = session.z - dz;
+
+    if (zone) {
+      const colliders = this.zoneColliders.get(zone.id);
+      if (colliders) {
+        const resolved = resolvePlayerMove(startX, startZ, dx, dz, colliders, PLAYER_RADIUS);
+        session.x = resolved.x;
+        session.z = resolved.z;
+        if (resolved.blockedX) session.vx = 0;
+        if (resolved.blockedZ) session.vz = 0;
+      } else {
+        const clamped = clampToBounds(startX + dx, startZ + dz, zone.bounds, PLAYER_RADIUS);
+        session.x = clamped.x;
+        session.z = clamped.z;
+        if (clamped.blockedX) session.vx = 0;
+        if (clamped.blockedZ) session.vz = 0;
+      }
+    }
+
+    const at = zoneAt(this.world, session.x, session.z);
+    if (at) session.zoneId = at.id;
   }
 
   /** Портал переносит игрока в соседнюю зону. Решение принимает сервер. */
@@ -613,7 +670,10 @@ export class SectorRoom extends Room {
     }
 
     session.x = x;
+    session.y = 0;
     session.z = z;
+    session.vy = 0;
+    session.airborne = false;
     session.zoneId = portal.toZone;
     session.teleportUntil = now + PORTAL_COOLDOWN_MS;
 
