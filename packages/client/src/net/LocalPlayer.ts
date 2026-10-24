@@ -2,26 +2,22 @@
  * Локальный игрок: предсказание движения + сверка с сервером.
  *
  * Клиент интегрирует движение теми же числами и тем же фиксированным шагом,
- * что и сервер (общая `stepVelocity` из протокола), поэтому в обычной игре
- * расхождение равно сетевой задержке, а не ошибке физики.
- *
- * Важно: предсказание — это то, что видит игрок. Мы НЕ тянем картинку к
- * последнему серверному снимку: снимок описывает прошлое, и подтягивание к
- * нему добавляет ровно ту задержку, от которой предсказание избавляет.
- *
- * Поэтому:
- *  - расхождение меньше допуска игнорируется целиком (это просто лаг);
- *  - заметное (упёрлись в стену, телепорт, рассинхрон) — гасится по частям
- *    на каждом серверном апдейте, а не размазывается по кадрам;
- *  - большое (телепорт, реконнект) — мгновенный сдвиг.
- *
- * Раньше здесь ошибка накапливалась каждый кадр (`error += err`) и гасилась
- * умножением. На 60 fps это давало равновесие в несколько метров, и камера
- * уезжала вперёд от собственного аватара. Не повторяем.
+ * что и сервер (общая `stepVelocity` + `stepVertical` + `resolvePlayerMove`),
+ * поэтому в обычной игре расхождение равно сетевой задержке, а не ошибке
+ * физики или коллизий.
  */
 
-import { stepVelocity } from '@oasis/protocol';
-import type { EntityState } from '@oasis/protocol';
+import {
+  GROUND_Y,
+  PLAYER_RADIUS,
+  clampToBounds,
+  resolvePlayerMove,
+  stepVelocity,
+  stepVertical,
+  type EntityState,
+  type ZoneBounds,
+  type ZoneColliders,
+} from '@oasis/protocol';
 
 /** Больше этого — считаем «срывом» (реконнект, баг) и прыгаем. */
 const SNAP_DISTANCE = 6.0;
@@ -32,53 +28,39 @@ const SNAP_DISTANCE = 6.0;
 const SOFT_TOLERANCE = 1.0;
 /** Доля «излишка» сверх допуска, которую гасим за один серверный апдейт. */
 const CORRECTION_PER_UPDATE = 0.4;
+/** Сколько тиков держим буфер прыжка, если нажали чуть раньше приземления. */
+const JUMP_BUFFER_TICKS = 4;
 
-/** Границы зоны: клиент повторяет серверный clampToZone, иначе — откаты. */
-export interface ZoneBounds {
-  x: number;
-  z: number;
-  w: number;
-  d: number;
-}
+export type { ZoneBounds };
 
 export class LocalPlayer {
   /** Позиция на последнем завершённом тике (совпадает с серверной моделью). */
   x = 0;
+  y = GROUND_Y;
   z = 0;
   yaw = 0;
 
   vx = 0;
+  vy = 0;
   vz = 0;
 
   private accumulator = 0;
   private dirX = 0;
   private dirZ = 0;
   private sprint = false;
+  private crouch = false;
+  /** Буфер прыжка: тики, пока ждём землю. */
+  private jumpBuffer = 0;
   private bounds: ZoneBounds | null = null;
-  /** Максимальное отставание картинки от авторитета, метры. */
-  private aheadAbs = 0;
+  private colliders: ZoneColliders | null = null;
 
   /** Последний отправленный seq — для отладки и будущей дедупликации. */
   seq = 0;
 
   /**
    * Сколько тиков предсказания уже проинтегрировано.
-   *
-   * Тик фиксированный (50 мс), а кадры — нет: между двумя кадрами может не
-   * пройти ни одного тика, а может пройти три. Без этого счётчика нельзя
-   * отличить «плавный разгон» от «прыжка на целевую скорость», если смотреть
-   * на скорость по кадрам: на медленной машине разгон целиком укладывается
-   * между двумя кадрами.
    */
   simTicks = 0;
-
-  /**
-   * Граница догона: снимок на RTT отстаёт, поэтому предсказание всегда
-   * чуть впереди сервера. Экстраполяцию за эту границу не пускаем —
-   * иначе мгновенный разворот рисует бросок на всю длину лага.
-   */
-  private aheadX = 0;
-  private aheadZ = 0;
 
   private readonly tickDtMs: number;
 
@@ -86,45 +68,84 @@ export class LocalPlayer {
     this.tickDtMs = tickDtMs;
     this.x = startX;
     this.z = startZ;
+    this.y = GROUND_Y;
   }
 
-  /**
-   * Позиция для рендера: тик идёт раз в 50 мс, и без экстраполяции аватар
-   * прыгал бы на 0.25–0.4 м 20 раз в секунду. Досчитываем дробный шаг
-   * вперёд по текущей скорости — картинка становится непрерывной.
-   */
   get renderX(): number {
-    return this.clampX(this.x + this.aheadX);
+    return this.renderPose().x;
+  }
+
+  get renderY(): number {
+    const t = this.accumulator / 1000;
+    return Math.max(GROUND_Y, this.y + this.vy * t);
   }
 
   get renderZ(): number {
-    return this.clampZ(this.z + this.aheadZ);
+    return this.renderPose().z;
   }
 
-  /** Границы текущей зоны (null — не ограничивать). */
+  get grounded(): boolean {
+    return this.y <= GROUND_Y + 1e-4 && this.vy <= 1e-4;
+  }
+
+  get airborne(): boolean {
+    return !this.grounded;
+  }
+
+  /** Границы текущей зоны (null — не ограничивать). Коллайдеры пропов сбрасываем. */
   setBounds(bounds: ZoneBounds | null): void {
     this.bounds = bounds;
-    // Новая зона может не содержать текущую точку — сразу приводим себя в неё,
-    // иначе первый же кадр покажет игрока за стеной.
-    this.clamp();
+    this.colliders = null;
+    this.clampInPlace();
+  }
+
+  /** Коллайдеры пропов зоны (F1-1). Подставляют bounds из сетки. */
+  setColliders(colliders: ZoneColliders | null): void {
+    this.colliders = colliders;
+    if (colliders) this.bounds = colliders.bounds;
+    this.clampInPlace();
   }
 
   /** Мгновенный перенос (портал): без него предсказание «идёт» через пустоту. */
   teleportTo(x: number, z: number): void {
     this.x = x;
     this.z = z;
+    this.y = GROUND_Y;
+    this.vy = 0;
     this.accumulator = 0;
-    this.aheadX = 0;
-    this.aheadZ = 0;
-    this.aheadAbs = 0;
-    this.clamp();
+    this.jumpBuffer = 0;
+    this.clampInPlace();
   }
 
-  /** Направление движения в мировых координатах (уже повёрнутое на yaw). */
-  setDirection(dirX: number, dirZ: number, sprint: boolean): void {
+  /**
+   * Направление + флаги. `jump` — одно нажатие Space: кладём в буфер,
+   * чтобы прыжок сработал даже если нажали за кадр до приземления.
+   */
+  setDirection(
+    dirX: number,
+    dirZ: number,
+    sprint: boolean,
+    crouch = false,
+    jump = false,
+  ): void {
     this.dirX = dirX;
     this.dirZ = dirZ;
-    this.sprint = sprint;
+    this.sprint = sprint && !crouch;
+    this.crouch = crouch;
+    if (jump) this.jumpBuffer = JUMP_BUFFER_TICKS;
+  }
+
+  get crouching(): boolean {
+    return this.crouch;
+  }
+
+  get sprinting(): boolean {
+    return this.sprint;
+  }
+
+  /** Есть ли ещё импульс прыжка в буфере (для отправки на сервер). */
+  get jumpPending(): boolean {
+    return this.jumpBuffer > 0;
   }
 
   /** Интегрирует движение фиксированным шагом, как сервер. */
@@ -139,91 +160,105 @@ export class LocalPlayer {
     }
 
     if (guard >= 16) {
-      // Цикл не успел за реальным временем (вкладка в фоне, лаг).
-      // Догоняем одним шагом, но фиксированным dt — иначе движение
-      // ускорится ровно во столько раз, сколько времени потеряли.
       this.accumulator = 0;
       this.simulateTick(dt);
     }
   }
 
-  /** Один тик: модель движения + границы. Общая с сервером формула. */
   private simulateTick(dt: number): void {
     this.simTicks += 1;
-    const velocity = stepVelocity(this.vx, this.vz, this.dirX, this.dirZ, this.sprint, dt);
+    const velocity = stepVelocity(
+      this.vx,
+      this.vz,
+      this.dirX,
+      this.dirZ,
+      this.sprint,
+      dt,
+      this.crouch,
+    );
     this.vx = velocity.vx;
     this.vz = velocity.vz;
 
-    this.x += this.vx * dt;
-    this.z += this.vz * dt;
+    this.applyMotion(this.vx * dt, this.vz * dt);
 
-    // Догоняем ровно на один кадр, но не больше накопленного отставания
-    // от авторитета: развернулся — картинка не летит назад через полкарты.
-    const stepX = this.vx * dt;
-    const stepZ = this.vz * dt;
-    this.aheadX = Math.max(-this.aheadAbs, Math.min(this.aheadAbs, this.aheadX + stepX));
-    this.aheadZ = Math.max(-this.aheadAbs, Math.min(this.aheadAbs, this.aheadZ + stepZ));
-
-    this.clamp();
+    const wantJump = this.jumpBuffer > 0;
+    const vertical = stepVertical(this.y, this.vy, wantJump, this.crouch, dt);
+    this.y = vertical.y;
+    this.vy = vertical.vy;
+    if (vertical.jumped || this.jumpBuffer > 0) {
+      this.jumpBuffer = vertical.jumped ? 0 : Math.max(0, this.jumpBuffer - 1);
+    }
   }
 
-  /** То же ограничение, что и на сервере: игрок не выходит за прямоугольник зоны. */
-  private clamp(): void {
-    const nextX = this.clampX(this.x);
-    const nextZ = this.clampZ(this.z);
-    if (nextX !== this.x) this.vx = 0;
-    if (nextZ !== this.z) this.vz = 0;
-    this.x = nextX;
-    this.z = nextZ;
+  private renderPose(): { x: number; z: number } {
+    const t = this.accumulator / 1000;
+    return this.resolveDelta(this.x, this.z, this.vx * t, this.vz * t);
   }
 
-  private clampX(value: number): number {
-    const bounds = this.bounds;
-    if (!bounds) return value;
-    const half = bounds.w / 2;
-    return Math.min(Math.max(value, bounds.x - half), bounds.x + half);
+  private applyMotion(dx: number, dz: number): void {
+    const resolved = this.resolveDelta(this.x, this.z, dx, dz);
+    if (resolved.blockedX) this.vx = 0;
+    if (resolved.blockedZ) this.vz = 0;
+    this.x = resolved.x;
+    this.z = resolved.z;
   }
 
-  private clampZ(value: number): number {
-    const bounds = this.bounds;
-    if (!bounds) return value;
-    const half = bounds.d / 2;
-    return Math.min(Math.max(value, bounds.z - half), bounds.z + half);
+  private resolveDelta(
+    x: number,
+    z: number,
+    dx: number,
+    dz: number,
+  ): { x: number; z: number; blockedX: boolean; blockedZ: boolean } {
+    if (this.colliders) {
+      return resolvePlayerMove(x, z, dx, dz, this.colliders, PLAYER_RADIUS);
+    }
+    const nextX = x + dx;
+    const nextZ = z + dz;
+    if (!this.bounds) {
+      return { x: nextX, z: nextZ, blockedX: false, blockedZ: false };
+    }
+    return clampToBounds(nextX, nextZ, this.bounds, PLAYER_RADIUS);
   }
 
-  /**
-   * Сверка с авторитетным состоянием. Вызывать на каждый новый серверный
-   * снимок/дельту, а не каждый кадр — иначе один и тот же старый ответ
-   * применяется десятки раз.
-   */
+  private clampInPlace(): void {
+    const resolved = this.resolveDelta(this.x, this.z, 0, 0);
+    if (resolved.blockedX) this.vx = 0;
+    if (resolved.blockedZ) this.vz = 0;
+    this.x = resolved.x;
+    this.z = resolved.z;
+  }
+
   reconcile(authoritative: EntityState): void {
     const dx = authoritative.x - this.x;
     const dz = authoritative.z - this.z;
-    const distance = Math.hypot(dx, dz);
-
-    // Сколько мы сейчас впереди сервера. Это и есть бюджет догона:
-    // больше снимка мы не знаем, значит и рисовать дальше не имеем права.
-    this.aheadAbs = Math.min(distance, 2);
+    const dy = authoritative.y - this.y;
+    const distance = Math.hypot(dx, dz, dy);
 
     if (distance > SNAP_DISTANCE) {
       this.x = authoritative.x;
+      this.y = authoritative.y;
       this.z = authoritative.z;
       this.vx = 0;
+      this.vy = 0;
       this.vz = 0;
-      this.aheadX = 0;
-      this.aheadZ = 0;
-      this.aheadAbs = 0;
-      this.clamp();
+      this.accumulator = 0;
+      this.jumpBuffer = 0;
+      this.clampInPlace();
       return;
     }
 
-    if (distance <= SOFT_TOLERANCE) return;
+    if (distance <= SOFT_TOLERANCE) {
+      // Высоту подтягиваем мягче — иначе прыжок «прилипает» к старому снимку.
+      if (Math.abs(dy) > 0.35) this.y += dy * 0.25;
+      return;
+    }
 
     const excess = distance - SOFT_TOLERANCE;
     const pull = (excess / distance) * CORRECTION_PER_UPDATE;
     this.x += dx * pull;
+    this.y += dy * pull;
     this.z += dz * pull;
-    this.clamp();
+    this.clampInPlace();
   }
 
   nextSeq(): number {
