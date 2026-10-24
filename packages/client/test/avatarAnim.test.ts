@@ -10,7 +10,7 @@ import { describe, it } from 'node:test';
 import { animateAvatar, createAvatar } from '../src/render/avatars.ts';
 
 describe('F1-4: анимация аватара', () => {
-  it('в движении качает ноги и поднимает риг', () => {
+  it('в движении качает ноги', () => {
     const avatar = createAvatar(0x4fa3ff);
     const parts = avatar.userData.avatar as {
       rig: { position: { y: number }; rotation: { x: number } };
@@ -26,7 +26,9 @@ describe('F1-4: анимация аватара', () => {
       Math.abs(parts.legL.rotation.x) > 0.05 || Math.abs(parts.legR.rotation.x) > 0.05,
       'ноги должны качаться при ходьбе',
     );
-    assert.ok(parts.rig.rotation.x > 0.02, 'корпус должен наклоняться в бег');
+    // Без bob/lean рига: иначе с камеры 3-го лица трясётся весь мир.
+    assert.equal(parts.rig.position.y, 0);
+    assert.equal(parts.rig.rotation.x, 0);
   });
 
   it('в покое возвращает наклон ближе к нулю', () => {
@@ -43,5 +45,23 @@ describe('F1-4: анимация аватара', () => {
     assert.ok(Math.abs(parts.legL.rotation.x) < 0.05);
     assert.ok(Math.abs(parts.legR.rotation.x) < 0.05);
     assert.ok(Math.abs(parts.rig.rotation.x) < 0.02);
+  });
+
+  it('в приседе опускает корпус и прячет ноги', () => {
+    const avatar = createAvatar(0x6fcf7f);
+    const parts = avatar.userData.avatar as {
+      hips: { position: { y: number } };
+      legL: { visible: boolean };
+      legR: { visible: boolean };
+      rest: { hipsY: number };
+    };
+
+    for (let i = 0; i < 40; i += 1) {
+      animateAvatar(avatar, 0, 16, { crouch: true });
+    }
+
+    assert.ok(parts.hips.position.y < parts.rest.hipsY - 0.25, 'таз должен опуститься');
+    assert.equal(parts.legL.visible, false, 'ноги спрятаны');
+    assert.equal(parts.legR.visible, false, 'ноги спрятаны');
   });
 });

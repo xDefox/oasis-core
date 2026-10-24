@@ -19,17 +19,34 @@ export class Input {
   /** Наклон камеры, радианы (вверх — положительный). */
   pitch = -0.12;
 
+  /** Одноразовый запрос прыжка (Space, без автоповтора). */
+  private jumpQueued = false;
+  /** Желаемая дистанция камеры (колёсико), м. */
+  private _cameraDistance = 4.2;
+
   private readonly canvas: HTMLCanvasElement;
   private pointerLocked = false;
   private readonly onLockChange: (locked: boolean) => void;
+  private readonly cameraDistanceMin: number;
+  private readonly cameraDistanceMax: number;
 
-  constructor(canvas: HTMLCanvasElement, onLockChange: (locked: boolean) => void) {
+  constructor(
+    canvas: HTMLCanvasElement,
+    onLockChange: (locked: boolean) => void,
+    cameraDistance = { default: 4.2, min: 1.6, max: 7.5 },
+  ) {
     this.canvas = canvas;
     this.onLockChange = onLockChange;
+    this._cameraDistance = cameraDistance.default;
+    this.cameraDistanceMin = cameraDistance.min;
+    this.cameraDistanceMax = cameraDistance.max;
 
     window.addEventListener('keydown', (event) => this.onKeyDown(event));
     window.addEventListener('keyup', (event) => this.keys.delete(event.code));
-    window.addEventListener('blur', () => this.keys.clear());
+    window.addEventListener('blur', () => {
+      this.keys.clear();
+      this.jumpQueued = false;
+    });
 
     canvas.addEventListener('click', () => {
       if (!this.pointerLocked) void canvas.requestPointerLock();
@@ -44,9 +61,29 @@ export class Input {
       if (!this.pointerLocked) return;
       this.yaw -= event.movementX * 0.0022;
       this.pitch -= event.movementY * 0.0022;
-      const limit = Math.PI / 2 - 0.05;
-      this.pitch = Math.max(-limit, Math.min(limit, this.pitch));
+      // Чуть уже вверх: иначе камера уходит под пол за спиной.
+      const limitUp = Math.PI / 2 - 0.18;
+      const limitDown = Math.PI / 2 - 0.05;
+      this.pitch = Math.max(-limitDown, Math.min(limitUp, this.pitch));
     });
+
+    canvas.addEventListener(
+      'wheel',
+      (event) => {
+        if (!this.pointerLocked) return;
+        event.preventDefault();
+        // deltaY > 0 — отдаляем.
+        this._cameraDistance = Math.min(
+          this.cameraDistanceMax,
+          Math.max(this.cameraDistanceMin, this._cameraDistance + event.deltaY * 0.004),
+        );
+      },
+      { passive: false },
+    );
+  }
+
+  get cameraDistance(): number {
+    return this._cameraDistance;
   }
 
   private onKeyDown(event: KeyboardEvent): void {
@@ -59,6 +96,17 @@ export class Input {
       event.preventDefault();
       if (this.pointerLocked) document.exitPointerLock();
     }
+    if (event.code === 'Space') {
+      event.preventDefault();
+      if (!event.repeat) this.jumpQueued = true;
+    }
+  }
+
+  /** Забирает одно нажатие Space (для предсказания и отправки на сервер). */
+  consumeJump(): boolean {
+    const pressed = this.jumpQueued;
+    this.jumpQueued = false;
+    return pressed;
   }
 
   /** Вернуть управление: вызывается по клику, когда чат закрыт. */
@@ -71,7 +119,14 @@ export class Input {
   }
 
   get sprinting(): boolean {
+    // Присед важнее бега: Shift+Ctrl = присед.
+    if (this.crouching) return false;
     return this.keys.has('ShiftLeft') || this.keys.has('ShiftRight');
+  }
+
+  /** Ctrl — приседание. */
+  get crouching(): boolean {
+    return this.keys.has('ControlLeft') || this.keys.has('ControlRight');
   }
 
   /** Направление движения в мировых координатах, нормализованное. */

@@ -96,6 +96,8 @@ export function buildZone(zone: ZoneDef): Group {
   const ground = new Mesh(new BoxGeometry(zone.bounds.w, 0.4, zone.bounds.d), groundMaterial);
   ground.position.set(zone.bounds.x, -0.2, zone.bounds.z);
   ground.receiveShadow = false;
+  // Пол не участвует в антиклипе камеры — иначе взгляд вверх «прилипает» к земле.
+  ground.userData.isGround = true;
   group.add(ground);
 
   const materials = new Map<number, Material>();
