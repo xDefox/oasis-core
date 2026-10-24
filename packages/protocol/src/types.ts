@@ -143,7 +143,7 @@ export interface HelloMsg {
 }
 
 export interface InputMsg {
-  /** Монотонный номер инпута — для дедупликации и отладки. */
+  /** Монотонный номер инпута — для отладки. */
   seq: number;
   /** Направление движения в мировых координатах, нормализовано. */
   dirX: number;
@@ -151,6 +151,10 @@ export interface InputMsg {
   /** Курс камеры, радианы. */
   yaw: number;
   sprint: boolean;
+  /** Присед (Ctrl). Приоритетнее спринта. */
+  crouch: boolean;
+  /** Прыжок (Space), импульс — только с земли. */
+  jump: boolean;
 }
 
 export interface ChatMsg {
