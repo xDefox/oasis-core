@@ -60,7 +60,11 @@ const MUTATIONS = [
   {
     name: 'спринт не отличается от шага',
     file: 'packages/protocol/src/movement.ts',
-    from: '    const speed = sprint ? PLAYER_SPRINT_SPEED : PLAYER_SPEED;',
+    from: `    const speed = crouch
+      ? PLAYER_CROUCH_SPEED
+      : sprint
+        ? PLAYER_SPRINT_SPEED
+        : PLAYER_SPEED;`,
     to: '    const speed = PLAYER_SPEED;',
     expect: 'движение: разгон',
   },

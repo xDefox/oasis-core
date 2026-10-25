@@ -33,9 +33,41 @@ if (before.visibleOthers !== 1) {
 }
 
 // ── ведём walker к порталу, подруливая по фактической позиции ───────────
-// yaw = 0: W = −Z, S = +Z, D = +X.
+// yaw = 0: W = −Z, S = +Z, D = +X, A = −X.
+//
+// С F1-1 пропы реально блокируют: старая схема «всегда вперёд (D) + чинить z»
+// заворачивала walker под лавку и там умирал — движение вбок было невозможно,
+// а зонд проверял планировку, а не уход из зоны. Теперь подруливаем по обеим
+// осям, как в zone-unload: это тот же контроллер, что уже стабильно доносит
+// игрока до портала.
 await walker.bringToFront();
 await delay(400);
+
+// Клавиши держим НЕПРЕРЫВНО и меняем только то, что реально изменилось.
+//
+// Цикл «всё отпустить → подождать → всё нажать» здесь не работает: спринт
+// даёт 8 м/с, а разворот при ускорении 28 м/с² занимает ~0.4 с — дольше
+// одного шага в 280 мс. В итоге каждый смена направления давала сетку
+// отрицательного прироста: walker «доворачивал» в старую сторону, уезжал
+// под лавку и там вставал намертво. С непрерывным вводом скорость
+// разворачивается в тике, пока клавиша ещё зажата.
+const held = new Set(['ShiftLeft']);
+await walker.keyboard.down('ShiftLeft');
+
+async function setKeys(next) {
+  for (const key of [...held]) {
+    if (key !== 'ShiftLeft' && !next.includes(key)) {
+      await walker.keyboard.up(key);
+      held.delete(key);
+    }
+  }
+  for (const key of next) {
+    if (!held.has(key)) {
+      await walker.keyboard.down(key);
+      held.add(key);
+    }
+  }
+}
 
 const startZone = (await debug(walker)).zone?.id ?? null;
 let reachedPortal = false;
@@ -47,17 +79,21 @@ for (let step = 0; step < 60; step += 1) {
     break;
   }
 
+  const dx = PORTAL.x - state.x;
   const dz = PORTAL.z - state.z;
-  const keys = ['KeyD'];
-  if (dz > 0.8) keys.push('KeyS');
-  if (dz < -0.8) keys.push('KeyW');
+  const keys = [];
+  if (dx > 0.6) keys.push('KeyD');
+  if (dx < -0.6) keys.push('KeyA');
+  if (dz > 0.6) keys.push('KeyS');
+  if (dz < -0.6) keys.push('KeyW');
+  if (keys.length === 0) keys.push('KeyD');
 
-  await walker.keyboard.down('ShiftLeft');
-  await Promise.all(keys.map((key) => walker.keyboard.down(key)));
-  await delay(300);
-  await Promise.all(keys.map((key) => walker.keyboard.up(key)));
-  await walker.keyboard.up('ShiftLeft');
+  await setKeys(keys);
+  await delay(280);
 }
+
+await setKeys([]);
+await walker.keyboard.up('ShiftLeft');
 
 if (!reachedPortal) {
   const state = await debug(walker);
