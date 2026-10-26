@@ -128,6 +128,19 @@ const PLAYER_COLORS = [
   0x4fa3ff, 0xff7a59, 0x6fcf7f, 0xffd166, 0xc792ea, 0x59d4d4, 0xff8fa3, 0x9ad36f,
 ];
 
+/**
+ * Живые экземпляры сектора на этом процессе.
+ *
+ * Colyseus отдаёт снаружи только кеш matchmaker'а (`IRoomCache` — id, счётчики,
+ * метаданные), а тестовому хуку нужен сам объект комнаты: позиции игроков
+ * живут в нём. Комната пополняет реестр сама — onCreate добавляет,
+ * onDispose убирает.
+ */
+const liveRooms = new Set<SectorRoom>();
+
+/** Живые секторы (обычно один) — для HTTP-хука `POST /debug/move`. */
+export const sectorRooms = (): SectorRoom[] => [...liveRooms];
+
 export class SectorRoom extends Room {
   private world!: WorldDef;
   private ledger!: Ledger;
@@ -155,6 +168,7 @@ export class SectorRoom extends Room {
   private readonly maxTickDurations = 2000;
 
   override onCreate(options: SectorRoomOptions): void {
+    liveRooms.add(this);
     this.world = options.world;
     this.ledger = options.ledger;
     this.maxPlayers = options.maxPlayers ?? 64;
@@ -473,6 +487,7 @@ export class SectorRoom extends Room {
   }
 
   override onDispose(): void {
+    liveRooms.delete(this);
     logInfo('сектор закрыт', { players: this.sessions.size });
   }
 
@@ -669,16 +684,48 @@ export class SectorRoom extends Room {
       }
     }
 
+    session.teleportUntil = now + PORTAL_COOLDOWN_MS;
+    this.applyTeleport(session, x, z, portal.toZone);
+  }
+
+  /**
+   * Переносит игрока в другую зону. Тот же путь, что у портала, но без
+   * привязки к геометрии: целевую зону выбирает сервер, точку — центр её
+   * bounds. Это тестовый хук (см. `OASIS_TEST_HOOKS` в config).
+   *
+   * Возвращает, откуда и куда ушёл, или null, если игрока/зены нет.
+   */
+  moveToOtherZone(name: string): { from: string; to: string; x: number; z: number } | null {
+    const session = [...this.sessions.values()].find((candidate) => candidate.name === name);
+    const fromZone = session?.zoneId;
+    if (!session || !fromZone) return null;
+
+    const destination = this.world.zones.find((zone) => zone.id !== fromZone);
+    if (!destination) return null;
+
+    const x = destination.bounds.x + destination.bounds.w / 2;
+    const z = destination.bounds.z + destination.bounds.d / 2;
+
+    this.applyTeleport(session, x, z, destination.id);
+    // Скорость обнуляем: иначе игрок продолжает «уезжать» из новой точки
+    // с той, что была до переноса.
+    session.vx = 0;
+    session.vz = 0;
+
+    return { from: fromZone, to: destination.id, x, z };
+  }
+
+  /** Единая точка переноса: позиция, зона и уведомление клиента. */
+  private applyTeleport(session: Session, x: number, z: number, zoneId: string): void {
     session.x = x;
     session.y = 0;
     session.z = z;
     session.vy = 0;
     session.airborne = false;
-    session.zoneId = portal.toZone;
-    session.teleportUntil = now + PORTAL_COOLDOWN_MS;
+    session.zoneId = zoneId;
 
     session.client.send(S2C.Teleport, {
-      zoneId: portal.toZone,
+      zoneId,
       position: { x: session.x, y: session.y, z: session.z },
     });
   }
