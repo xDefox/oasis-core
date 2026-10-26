@@ -116,24 +116,47 @@ const bodyGone = await watcher
   .catch(() => false);
 
 const after = await debug(watcher);
+const walkerAfter = await debug(walker);
 console.log('после ухода:', {
   roster: after.roster,
   visibleOthers: after.visibleOthers,
   trackedOthers: after.trackedOthers,
 });
+console.log('walker ушёл:', { zone: walkerAfter.zone?.id, roster: walkerAfter.roster });
 
 if (!bodyGone) {
   problems.add(`тело ушедшего игрока осталось видимым: ${after.visibleOthers}`);
 }
-// Ростер — реестр мира, а не список видимых: игрок всё ещё в мире.
-if (after.roster !== 2) {
-  problems.add(`ростер должен остаться из двух (он ещё в мире): ${after.roster}`);
-}
 
-const walkerAfter = await debug(walker);
-console.log('walker ушёл:', { zone: walkerAfter.zone?.id, roster: walkerAfter.roster });
-if (walkerAfter.roster !== 2) {
-  problems.add(`у ушедшего игрока ростер тоже должен остаться из двух: ${walkerAfter.roster}`);
+// Ростер — реестр мира, а не список видимых: оба игрока обязаны остаться
+// в нём, хотя walker ушёл в другую зону.
+//
+// Своих ищем по именам, а не по точному счётчику. В реестре висят чужие
+// сессии в grace-окне F0-8 от предыдущих зондов (30 с), и их срок истекает
+// ровно во время проверки: ростер падает с 3 до 2 прямо под замером, и чек
+// падал на живом коде. Инвариант теста — состав, а не размер.
+for (const side of [
+  {
+    label: 'наблюдателя',
+    self: after.selfName,
+    other: walkerAfter.selfName,
+    roster: after.rosterPlayers,
+  },
+  {
+    label: 'ушедшего',
+    self: walkerAfter.selfName,
+    other: after.selfName,
+    roster: walkerAfter.rosterPlayers,
+  },
+]) {
+  const names = (side.roster ?? []).map((player) => player.name);
+  const missing = [side.self, side.other].filter((name) => name && !names.includes(name));
+  if (missing.length > 0) {
+    problems.add(
+      `у ${side.label} в ростере нет обоих игроков (нет: ${missing.join(', ')}; ` +
+        `есть: ${names.join(', ') || '—'})`,
+    );
+  }
 }
 
 await watcher.screenshot({ path: '/tmp/oasis-zone-exit.png' }).catch(() => {});

@@ -28,6 +28,9 @@ import {
   GENESIS_ACCOUNT_MIN_AGE_MS,
   GENESIS_FRESH_ACCOUNT_FACTOR,
   GENESIS_GRANT,
+  GROUND_Y,
+  PLAYER_CROUCH_HEIGHT,
+  PLAYER_HEIGHT,
   PLAYER_RADIUS,
   PROTOCOL_VERSION,
   S2C,
@@ -43,6 +46,7 @@ import {
   speedOf,
   stepVelocity,
   stepVertical,
+  supportHeightAt,
   type EntityState,
   type HelloMsg,
   type PlayerInfo,
@@ -726,9 +730,17 @@ export class SectorRoom extends Room {
 
       // Коллизии с пропами + край зоны (с радиусом). Та же формула, что
       // на клиенте в LocalPlayer — иначе предсказание резинит.
-      this.resolveMotion(session, session.x - prevX, session.z - prevZ);
+      this.resolveMotion(session, session.x - prevX, session.z - prevZ, crouch);
 
-      const vertical = stepVertical(session.y, session.vy, wantJump, crouch, dt);
+      // Высота опоры под ногами (F1-19): над пропом опора — его верх,
+      // около пропа — пол зоны. Ровно этот вызов есть и в LocalPlayer:
+      // разойдётся хотя бы на ступеньку — предсказание зажует резину.
+      const colliders = this.collidersFor(session);
+      const groundY = colliders
+        ? supportHeightAt(session.x, session.z, colliders, session.y)
+        : GROUND_Y;
+
+      const vertical = stepVertical(session.y, session.vy, wantJump, crouch, dt, groundY);
       session.y = vertical.y;
       session.vy = vertical.vy;
       session.airborne = !vertical.grounded;
@@ -836,8 +848,16 @@ export class SectorRoom extends Room {
   /**
    * Разрешает шаг против пропов текущей зоны и прижимает к bounds.
    * Обновляет zoneId по фактической точке (как старый clampToZone).
+   *
+   * `crouch` нужен для высоты тела: в приседе можно пройти под низким
+   * проёмом (F1-19).
    */
-  private resolveMotion(session: Session, dx: number, dz: number): void {
+  private resolveMotion(
+    session: Session,
+    dx: number,
+    dz: number,
+    crouch: boolean,
+  ): void {
     const zone = zoneAt(this.world, session.x, session.z) ?? (session.zoneId
       ? findZone(this.world, session.zoneId)
       : undefined);
@@ -847,7 +867,10 @@ export class SectorRoom extends Room {
     if (zone) {
       const colliders = this.zoneColliders.get(zone.id);
       if (colliders) {
-        const resolved = resolvePlayerMove(startX, startZ, dx, dz, colliders, PLAYER_RADIUS);
+        const resolved = resolvePlayerMove(startX, startZ, dx, dz, colliders, {
+          feetY: session.y,
+          height: crouch ? PLAYER_CROUCH_HEIGHT : PLAYER_HEIGHT,
+        });
         session.x = resolved.x;
         session.z = resolved.z;
         if (resolved.blockedX) session.vx = 0;
@@ -863,6 +886,19 @@ export class SectorRoom extends Room {
 
     const at = zoneAt(this.world, session.x, session.z);
     if (at) session.zoneId = at.id;
+  }
+
+  /**
+   * Коллизеры зоны, в которой игрок стоит сейчас (F1-19).
+   * Выбор зоны тот же, что в resolveMotion: по фактической точке, иначе
+   * последняя известная — иначе горизонталь и опора считались бы по разным
+   * зонам ровно на границе.
+   */
+  private collidersFor(session: Session): ZoneColliders | null {
+    const zone = zoneAt(this.world, session.x, session.z) ?? (session.zoneId
+      ? findZone(this.world, session.zoneId)
+      : undefined);
+    return zone ? (this.zoneColliders.get(zone.id) ?? null) : null;
   }
 
   /** Портал переносит игрока в соседнюю зону. Решение принимает сервер. */
