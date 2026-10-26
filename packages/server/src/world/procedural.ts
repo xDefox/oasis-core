@@ -7,6 +7,12 @@
  * что все видят одно и то же.
  */
 
+import { blocksBody, propCollider } from '@oasis/protocol';
+
+import { repairGaps } from './repairGaps.ts';
+import type { Clearing } from './worldCheck.ts';
+import { clearingHit } from './worldCheck.ts';
+
 /** Быстрый 32-битный PRNG (mulberry32). Период 2^32, достаточно для мира. */
 export function mulberry32(seed: number): () => number {
   let a = seed >>> 0;
@@ -54,6 +60,11 @@ export interface GenZoneOptions {
   count: number;
   /** Радиус центральной площадки, где объекты не ставятся (точка спавна). */
   clearRadius: number;
+  /**
+   * Запретные круги: диск портала, точка прибытия, кольцо спавна.
+   * Их считает `zoneClearings` — та же функция, что у автопроверки мира.
+   */
+  clearings: Clearing[];
   kind: 'plaza' | 'grove' | 'arena' | 'hub' | 'test';
 }
 
@@ -74,15 +85,37 @@ const PALETTE: Record<string, number[]> = {
 export function generateZoneProps(options: GenZoneOptions): GeneratedProp[] {
   const random = mulberry32((options.seed ^ hashString(options.zoneId)) >>> 0);
   const palette = PALETTE[options.kind] ?? PALETTE.test!;
-  const props: GeneratedProp[] = [];
+  /**
+   * Объекты зоны. Один элемент — то, что игрок обходит как одно целое:
+   * дерево (ствол + крона) или одиночный проп. Ставятся и двигаются они
+   * целиком, иначе крона уезжает от ствола.
+   */
+  const units: GeneratedProp[][] = [];
   const halfW = options.w / 2;
   const halfD = options.d / 2;
 
-  const push = (prop: GeneratedProp): void => {
+  /** Проп заходит в запретный круг — диск портала, точку прибытия, кольцо спавна. */
+  const inClearing = (prop: GeneratedProp): boolean => {
+    const collider = propCollider(prop);
+    if (!blocksBody(collider)) return false;
+    return options.clearings.some((clearing) => clearingHit(clearing, collider));
+  };
+
+  /** Проп стоит на свободном месте: вне центральной площадки и вне запретных кругов. */
+  const fits = (prop: GeneratedProp): boolean => {
     const dx = prop.x - options.cx;
     const dz = prop.z - options.cz;
-    if (Math.hypot(dx, dz) < options.clearRadius) return;
-    props.push(prop);
+    return Math.hypot(dx, dz) >= options.clearRadius && !inClearing(prop);
+  };
+
+  const push = (...props: GeneratedProp[]): void => {
+    if (props.length > 0 && props.every(fits)) units.push(props);
+  };
+
+  // Монумент стоит в центре площадки — ему clearRadius не помеха, а в
+  // запретные круги он всё равно не попадает.
+  const pushMonument = (prop: GeneratedProp): void => {
+    if (!inClearing(prop)) units.push([prop]);
   };
 
   if (options.kind === 'plaza' || options.kind === 'hub') {
@@ -106,8 +139,8 @@ export function generateZoneProps(options: GenZoneOptions): GeneratedProp[] {
         color: palette[Math.floor(random() * palette.length)]!,
       });
     }
-    // Монумент в центре (не должен попадать в clearRadius — выносим наружу руками).
-    props.push({
+    // Монумент в центре (для него clearRadius не действует).
+    pushMonument({
       id: `${options.zoneId}:monument`,
       type: 'box',
       x: options.cx,
@@ -141,30 +174,34 @@ export function generateZoneProps(options: GenZoneOptions): GeneratedProp[] {
       const x = options.cx + (random() * 2 - 1) * halfW * 0.92;
       const z = options.cz + (random() * 2 - 1) * halfD * 0.92;
       const trunkHeight = 1.4 + random() * 1.4;
-      push({
-        id: `${options.zoneId}:trunk${i}`,
-        type: 'cylinder',
-        x,
-        y: trunkHeight / 2,
-        z,
-        sx: 0.22,
-        sy: trunkHeight / 2,
-        sz: 0.22,
-        rot: 0,
-        color: 0x6b4a2f,
-      });
-      props.push({
-        id: `${options.zoneId}:crown${i}`,
-        type: 'cone',
-        x,
-        y: trunkHeight + 0.9,
-        z,
-        sx: 1.1 + random() * 0.5,
-        sy: 1.3,
-        sz: 1.1 + random() * 0.5,
-        rot: random() * Math.PI,
-        color: palette[Math.floor(random() * palette.length)]!,
-      });
+      // Ствол и крона — одно дерево: встают и уходят вместе. Раньше крона
+      // шла мимо `push` и в центре зоны оставалась висячая крона (crown49).
+      push(
+        {
+          id: `${options.zoneId}:trunk${i}`,
+          type: 'cylinder',
+          x,
+          y: trunkHeight / 2,
+          z,
+          sx: 0.22,
+          sy: trunkHeight / 2,
+          sz: 0.22,
+          rot: 0,
+          color: 0x6b4a2f,
+        },
+        {
+          id: `${options.zoneId}:crown${i}`,
+          type: 'cone',
+          x,
+          y: trunkHeight + 0.9,
+          z,
+          sx: 1.1 + random() * 0.5,
+          sy: 1.3,
+          sz: 1.1 + random() * 0.5,
+          rot: random() * Math.PI,
+          color: palette[Math.floor(random() * palette.length)]!,
+        },
+      );
     }
   } else {
     for (let i = 0; i < options.count; i += 1) {
@@ -176,7 +213,9 @@ export function generateZoneProps(options: GenZoneOptions): GeneratedProp[] {
         id: `${options.zoneId}:prop${i}`,
         type,
         x,
-        y: type === 'sphere' ? size : size,
+        // Коробка лежит наполовину в грунте (y0 = -size/2), сфера стоит на
+        // земле (y0 = 0): так мир выглядит в клиенте и так он закоммичен.
+        y: type === 'sphere' ? size : size / 2,
         z,
         sx: size,
         sy: size,
@@ -187,5 +226,12 @@ export function generateZoneProps(options: GenZoneOptions): GeneratedProp[] {
     }
   }
 
-  return props;
+  // Правила коллизий: щели, в которые игрок влезает и застревает, раздвигаем
+  // до проходимого зазора. Границы зоны и запретные круги не трогаем.
+  repairGaps(units, {
+    bounds: { x: options.cx, z: options.cz, w: options.w, d: options.d },
+    clearings: options.clearings,
+  });
+
+  return units.flat();
 }

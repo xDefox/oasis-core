@@ -44,6 +44,11 @@ jobs:
       - name: unit-тесты
         run: npm test
 
+      # Мир — данные, но и данные ломаются: щели, в которые влезаешь и
+      # застреваешь, порталы, забитые пропами, спавн под деревом.
+      - name: проверка мира
+        run: node --import tsx scripts/world-check.ts
+
       - name: сборка клиента
         run: npm run build
 
