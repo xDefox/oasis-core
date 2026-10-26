@@ -83,7 +83,7 @@ function recorder(room: {
 /** Подключение + запись сообщений + hello (после регистрации обработчиков). */
 async function joinWorld(
   client: Client,
-  hello: { accountId: string; accountCreatedAt: number; name: string },
+  hello: { accountId: string; accountCreatedAt: number; name: string; resume?: string },
   roomName = 'sector',
 ): Promise<{ room: Awaited<ReturnType<Client['joinOrCreate']>>; record: Recorder }> {
   const room = await client.joinOrCreate(roomName, {
@@ -91,6 +91,9 @@ async function joinWorld(
     ...hello,
   });
   const record = recorder(room);
+  // Тест изображает обрыв через leave(false); встроенный реконнект SDK
+  // поднял бы тот же сокет мимо нашего протокола и сломал сценарий.
+  room.reconnection.enabled = false;
   room.send('hello', { protocolVersion: PROTOCOL_VERSION });
   return { room, record };
 }
@@ -107,6 +110,29 @@ async function waitFor<T>(
     await new Promise((resolve) => setTimeout(resolve, 15));
   }
   throw new Error(`timeout: ${label}`);
+}
+
+const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Позиция своей сущности по всему, что записал тест.
+ *
+ * Снимок приходит только при входе, дальше идут дельты — поэтому fold по
+ * обоим спискам, иначе «позиция до обрыва» всегда была бы стартовой.
+ */
+function ownPosition(
+  record: Recorder,
+  playerId: number,
+): { x: number; z: number } | undefined {
+  let position: { x: number; z: number } | undefined;
+  const apply = (entities: EntityState[]): void => {
+    for (const entity of entities) {
+      if (entity.id === playerId) position = { x: entity.x, z: entity.z };
+    }
+  };
+  for (const snapshot of record.snapshots) apply(snapshot.entities);
+  for (const delta of record.deltas) apply(delta.changed);
+  return position;
 }
 
 describe('вертикальный срез: два игрока видят друг друга, двигаются, общаются', () => {
@@ -167,6 +193,13 @@ describe('вертикальный срез: два игрока видят др
       maxPlayers: 16,
     });
     gameServer.define('sector_aoi', SectorRoom, { world: aoiWorld, ledger, maxPlayers: 16 });
+    // Короткий резерв: проверять истечение 30 секунд в тесте — плохая идея.
+    gameServer.define('sector_resume', SectorRoom, {
+      world,
+      ledger,
+      maxPlayers: 4,
+      resumeGraceMs: 400,
+    });
     await gameServer.listen(PORT);
   });
 
@@ -677,5 +710,201 @@ describe('вертикальный срез: два игрока видят др
       });
     }
     assert.ok(true);
+  });
+
+  describe('возобновление места после обрыва (F0-8)', () => {
+    const url = `ws://localhost:${PORT}`;
+    const player = (suffix: string) => ({
+      accountId: `acct_resume_${suffix.padEnd(12, '0')}`,
+      accountCreatedAt: Date.now() - 30 * 24 * 60 * 60 * 1000,
+    });
+
+    /** Идёт вправо, затем гасит ввод: позиция должна перестать меняться. */
+    async function walkRight(room: { sendBytes: (type: string, data: Uint8Array) => unknown }): Promise<void> {
+      let seq = 0;
+      for (let i = 0; i < 12; i += 1) {
+        seq += 1;
+        room.sendBytes(BIN_CHANNEL, encodeInput({ seq, dirX: 1, dirZ: 0, yaw: 0, sprint: true }));
+        await delay(40);
+      }
+      for (let i = 0; i < 6; i += 1) {
+        seq += 1;
+        room.sendBytes(BIN_CHANNEL, encodeInput({ seq, dirX: 0, dirZ: 0, yaw: 0, sprint: false }));
+        await delay(40);
+      }
+    }
+
+    it('возвращает на то же место: тот же id, ник и позиция', async () => {
+      const account = player('alpha');
+      const first = await joinWorld(new Client(url), { ...account, name: 'resume-alpha' }, 'sector_resume');
+      const welcome = await waitFor(() => first.record.welcome, 8000, 'welcome');
+      assert.equal(welcome.resumed, false, 'первый вход — не возврат');
+      assert.ok(welcome.resumeToken.length >= 8, 'сервер должен выдать токен места');
+
+      await walkRight(first.room);
+      const before = ownPosition(first.record, welcome.playerId);
+      assert.ok(before, 'своя позиция не пришла в дельтах');
+      assert.ok(
+        Math.hypot(before.x - welcome.spawn.x, before.z - welcome.spawn.z) > 0.5,
+        'игрок должен был уйти со спавна, иначе проверка позиции ничего не значит',
+      );
+
+      // Обрыв без согласия: именно так выглядит спящий ноутбук и убитая вкладка.
+      await first.room.leave(false);
+      await delay(200);
+
+      const second = await joinWorld(
+        new Client(url),
+        { ...account, name: 'resume-alpha', resume: welcome.resumeToken },
+        'sector_resume',
+      );
+      const back = await waitFor(() => second.record.welcome, 8000, 'welcome после обрыва');
+
+      assert.equal(back.resumed, true, 'должны были вернуться, а не войти заново');
+      assert.equal(back.playerId, welcome.playerId, 'id сущности должен сохраниться');
+      assert.equal(back.name, 'resume-alpha', 'ник не должен получить суффикс');
+
+      const drift = Math.hypot(back.spawn.x - before.x, back.spawn.z - before.z);
+      assert.ok(drift < 0.3, `вернулись не туда: сдвиг ${drift.toFixed(2)} м`);
+      await second.room.leave();
+    });
+
+    it('забирает своё место у живого соединения по токену (сон/пробуждение)', async () => {
+      const account = player('takeover');
+      const first = await joinWorld(
+        new Client(url),
+        { ...account, name: 'resume-takeover' },
+        'sector_resume',
+      );
+      const welcome = await waitFor(() => first.record.welcome, 8000, 'welcome');
+      await walkRight(first.room);
+      const before = ownPosition(first.record, welcome.playerId)!;
+
+      // Старый сокет жив: сервер ещё не знает, что клиент на самом деле
+      // спит/перезагружается. Токен должен забрать место, а не отказать.
+      const kicked = new Promise<number>((resolve) => first.room.onLeave((code) => resolve(code)));
+      const second = await joinWorld(
+        new Client(url),
+        { ...account, name: 'resume-takeover', resume: welcome.resumeToken },
+        'sector_resume',
+      );
+      const back = await waitFor(() => second.record.welcome, 8000, 'welcome захвата');
+
+      assert.equal(back.resumed, true, 'токен должен забирать место у живого сокета');
+      assert.equal(back.playerId, welcome.playerId, 'тело должно остаться тем же');
+      assert.equal(back.name, 'resume-takeover');
+      assert.notEqual(back.resumeToken, welcome.resumeToken, 'токен ротируется при возврате');
+      assert.ok(
+        Math.hypot(back.spawn.x - before.x, back.spawn.z - before.z) < 0.3,
+        'вернулись не туда',
+      );
+      // Старое соединение закрыто с «место занято», иначе два сокета
+      // продолжили бы драться за одно тело.
+      assert.equal(await Promise.race([kicked, delay(2000).then(() => -1)]), 4003);
+
+      // Просроченный токен больше не даёт это место.
+      const third = await joinWorld(
+        new Client(url),
+        { ...account, name: 'resume-stale', resume: welcome.resumeToken },
+        'sector_resume',
+      );
+      const stale = await waitFor(() => third.record.welcome, 8000, 'welcome со старым токеном');
+      assert.equal(stale.resumed, false, 'старый токен должен быть мёртв');
+      assert.notEqual(stale.playerId, welcome.playerId);
+      await third.room.leave();
+      await second.room.leave();
+    });
+
+    it('без токена, но тем же аккаунтом и ником — тоже на место', async () => {
+      const account = player('account');
+      const first = await joinWorld(new Client(url), { ...account, name: 'resume-account' }, 'sector_resume');
+      const welcome = await waitFor(() => first.record.welcome, 8000, 'welcome');
+      await walkRight(first.room);
+      const before = ownPosition(first.record, welcome.playerId)!;
+
+      await first.room.leave(false);
+      await delay(200);
+
+      // Токен потерян (закрыли вкладку — sessionStorage умер), но аккаунт тот же.
+      const second = await joinWorld(
+        new Client(url),
+        { ...account, name: 'resume-account' },
+        'sector_resume',
+      );
+      const back = await waitFor(() => second.record.welcome, 8000, 'welcome без токена');
+
+      assert.equal(back.resumed, true, 'тот же аккаунт и ник — это возврат');
+      assert.equal(back.playerId, welcome.playerId);
+      assert.ok(
+        Math.hypot(back.spawn.x - before.x, back.spawn.z - before.z) < 0.3,
+        'вернулись не туда',
+      );
+      await second.room.leave();
+    });
+
+    it('явный выход место не держит: имя свободно сразу', async () => {
+      const first = await joinWorld(new Client(url), { ...player('explicit'), name: 'resume-explicit' }, 'sector_resume');
+      const welcome = await waitFor(() => first.record.welcome, 8000, 'welcome');
+
+      await first.room.leave();
+      await delay(150);
+
+      const second = await joinWorld(
+        new Client(url),
+        { ...player('other'), name: 'resume-explicit' },
+        'sector_resume',
+      );
+      const fresh = await waitFor(() => second.record.welcome, 8000, 'welcome нового игрока');
+
+      assert.equal(fresh.resumed, false, 'место после явного выхода не резервируется');
+      assert.equal(fresh.name, 'resume-explicit', 'ник освободился, суффикс не нужен');
+      assert.notEqual(fresh.playerId, welcome.playerId);
+      await second.room.leave();
+    });
+
+    it('место освобождается, если игрок не вернулся', async () => {
+      const first = await joinWorld(new Client(url), { ...player('expire'), name: 'resume-expire' }, 'sector_resume');
+      const welcome = await waitFor(() => first.record.welcome, 8000, 'welcome');
+
+      await first.room.leave(false);
+      // Резерв в этом секторе — 400 мс.
+      await delay(800);
+
+      const second = await joinWorld(
+        new Client(url),
+        { ...player('late'), name: 'resume-expire' },
+        'sector_resume',
+      );
+      const fresh = await waitFor(() => second.record.welcome, 8000, 'welcome после истечения');
+
+      assert.equal(fresh.resumed, false);
+      assert.equal(fresh.name, 'resume-expire', 'место и ник должны были освободиться');
+      assert.notEqual(fresh.playerId, welcome.playerId);
+      await second.room.leave();
+    });
+
+    it('чужой токен не отдаёт чужое место', async () => {
+      const owner = player('owner');
+      const first = await joinWorld(new Client(url), { ...owner, name: 'resume-owner' }, 'sector_resume');
+      const welcome = await waitFor(() => first.record.welcome, 8000, 'welcome');
+      await first.room.leave(false);
+      await delay(200);
+
+      // Токен утёк, но аккаунт другой: место не наше.
+      const thief = await joinWorld(
+        new Client(url),
+        {
+          ...player('thief'),
+          name: 'resume-thief',
+          resume: welcome.resumeToken,
+        },
+        'sector_resume',
+      );
+      const stolen = await waitFor(() => thief.record.welcome, 8000, 'welcome вора');
+
+      assert.equal(stolen.resumed, false, 'чужой аккаунт не должен получать место');
+      assert.notEqual(stolen.playerId, welcome.playerId);
+      await thief.room.leave();
+    });
   });
 });

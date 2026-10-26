@@ -124,6 +124,41 @@ const MUTATIONS = [
     to: '      client.send(S2C.Renamed, { name: next });',
     expect: 'переименовывает игрока',
   },
+  {
+    name: 'возобновление не пробует занять место раньше создания',
+    file: 'packages/server/src/rooms/SectorRoom.ts',
+    from: '    // Возврат на прежнее место — до всего остального: спавн, цвет и ник\n    // восстанавливаются из сессии, а не выдаются заново.\n    if (this.resume(client, hello)) return;\n\n    const sector = this.world.sectors[0];',
+    to: '    const sector = this.world.sectors[0];',
+    expect: 'возобновление места после обрыва',
+  },
+  {
+    name: 'возобновление не забирает место у живого соединения',
+    file: 'packages/server/src/rooms/SectorRoom.ts',
+    from: '    if (session.disconnectedAt === null) {\n      // Место занято живым соединением. Токен однозначно указывает на него,\n      // а аккаунт совпал — это мы же. Старый сокет закрываем.\n      logInfo(`место ${session.name} забирает новое соединение`, {\n        players: this.sessions.size,\n      });\n      try {\n        session.client.leave(4003, \'место занято новым соединением\');\n      } catch {\n        // Сокет уже мёртв — ровно то, что нам нужно.\n      }\n    }',
+    to: '    if (session.disconnectedAt === null) {\n      // мутация: живое соединение не выгоняется\n    }',
+    expect: 'забирает своё место у живого соединения',
+  },
+  {
+    name: 'возобновление не ротирует токен',
+    file: 'packages/server/src/rooms/SectorRoom.ts',
+    from: '    session.sent.clear();\n    session.resumeToken = randomUUID();\n    this.resumeTokens.set(session.resumeToken, session);\n    this.sessions.set(session.sessionId, session);\n\n    const welcome: WelcomeMsg = {\n      ...previous,\n      sessionId: session.sessionId,\n      // Клиент ставит предсказание ровно туда, где игрок пропал.\n      spawn: { x: session.x, y: session.y, z: session.z },\n      balance: session.balance,\n      resumeToken: session.resumeToken,\n      resumed: true,\n    };',
+    to: '    session.sent.clear();\n    this.resumeTokens.set(session.resumeToken, session);\n    this.sessions.set(session.sessionId, session);\n\n    const welcome: WelcomeMsg = {\n      ...previous,\n      sessionId: session.sessionId,\n      // Клиент ставит предсказание ровно туда, где игрок пропал.\n      spawn: { x: session.x, y: session.y, z: session.z },\n      balance: session.balance,\n      resumeToken: session.resumeToken,\n      resumed: true,\n    };',
+    expect: 'забирает своё место у живого соединения',
+  },
+  {
+    name: 'возобновление не помечает resumed',
+    file: 'packages/server/src/rooms/SectorRoom.ts',
+    from: '      resumeToken: session.resumeToken,\n      resumed: true,\n    };',
+    to: '      resumeToken: session.resumeToken,\n      resumed: false,\n    };',
+    expect: 'возвращает на то же место',
+  },
+  {
+    name: 'токен живого сокета не ищется',
+    file: 'packages/server/src/rooms/SectorRoom.ts',
+    from: '  private findResumable(hello: HelloMsg): Session | undefined {\n    if (hello.resume) {\n      const byToken = this.resumeTokens.get(hello.resume);\n      if (byToken) {\n        if (byToken.accountId !== hello.accountId) {\n          logWarn(\'токен возобновления от другого аккаунта\', {\n            token: hello.resume.slice(0, 8),\n          });\n          return undefined;\n        }\n        return byToken;\n      }\n    }',
+    to: '  private findResumable(hello: HelloMsg): Session | undefined {\n    if (hello.resume) {\n      const byToken = this.resumeTokens.get(hello.resume);\n      if (byToken) {\n        if (byToken.disconnectedAt === null) return undefined;\n        if (byToken.accountId !== hello.accountId) {\n          logWarn(\'токен возобновления от другого аккаунта\', {\n            token: hello.resume.slice(0, 8),\n          });\n          return undefined;\n        }\n        return byToken;\n      }\n    }',
+    expect: 'забирает своё место у живого соединения',
+  },
 ];
 
 async function runTests() {
