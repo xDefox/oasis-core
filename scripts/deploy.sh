@@ -1,25 +1,28 @@
 #!/usr/bin/env bash
-# Один шаг: собрать клиент под актуальный адрес туннеля, поднять сервер,
-# статику и два туннеля. Печатает ссылку для игроков.
+# Один шаг: поднять сервер, туннель и собрать клиент под адрес туннеля.
+# Печатает ссылку для игроков.
 #
 #   scripts/deploy.sh                      # cloudflare, при сбое — pinggy
 #   TUNNEL=cloudflare scripts/deploy.sh    # принудительно cloudflare
-#   TUNNEL=pinggy scripts/deploy.sh        # принудительно pinggy (аварийный)
+#   TUNNEL=pinggy scripts/deploy.sh        # принудительно pinggy
 #   node scripts/deploy-check.mjs          # проверить, что деплой играется
 #
-# Почему именно такой порядок: адрес wss-туннеля выдаётся только при старте
-# cloudflared, а он вшивается в бандл на этапе сборки. Поэтому сначала
-# поднимаем сервер и его туннель, потом собираем клиент, потом статику.
+# Почему один туннель, а не два (сначала было два): страница и WebSocket на
+# разных доменах — это две страницы входа. Бесплатные туннели показывают
+# предупреждение «ты уверен?» и запоминают согласие кукой на своём домене,
+# поэтому второй адрес пользователь обойти не может. Сервер отдаёт собранный
+# клиент сам (см. packages/server/src/index.ts), и всё живёт на одном хосте.
+#
+# Порядок: адрес wss-туннеля выдаётся только при старте туннеля, а он
+# вшивается в бандл на этапе сборки — поэтому сначала сервер и туннель,
+# потом сборка.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-STATIC_PORT="${STATIC_PORT:-8080}"
 GAME_PORT="${GAME_PORT:-2567}"
 STATE="$ROOT/.deploy-state"
-CLIENT_LOG=/tmp/tun-client.log
 SERVER_LOG=/tmp/tun-server.log
 SERVER_PID=/tmp/oasis-server.pid
-STATIC_PID=/tmp/oasis-static.pid
 
 cd "$ROOT"
 
@@ -38,7 +41,7 @@ url_from() {
   for i in $(seq 1 "$wait"); do
     local url
     # оба бэкенда печатают https://<случайный-хост>
-    url="$(grep -oE 'https://[a-z0-9-]+\.(trycloudflare\.com|free\.pinggy\.net|pinggy-free\.link|localhost\.run)' "$log" 2>/dev/null | grep -v 'api\.' | tail -1 || true)"
+    url="$(grep -oE 'https://[a-z0-9-]+\.(trycloudflare\.com|free\.pinggy\.net|pinggy-free\.link)' "$log" 2>/dev/null | grep -v 'api\.' | tail -1 || true)"
     if [ -n "$url" ]; then printf '%s' "$url"; return 0; fi
     sleep 1
   done
@@ -57,14 +60,15 @@ start_tunnel() {
     echo "  cloudflared не дал URL — пробую pinggy" >&2
     pkill -f "cloudflared tunnel .*localhost:$port" 2>/dev/null || true
   fi
+
   : > "$log"
   nohup bash scripts/tunnel-pinggy.sh "$port" "$log" >/dev/null 2>&1 &
   url="$(url_from "$log" 45)" || return 1
   printf '%s' "$url"
 }
 
-# ── 1. предупредить, если порты заняты ────────────────────────────────────
-for p in "$GAME_PORT" "$STATIC_PORT"; do
+# ── 1. освободить порты ────────────────────────────────────────────────────
+for p in "$GAME_PORT" 8080 5173; do
   if alive "$p"; then
     pid="$(lsof -ti:"$p" | head -1)"
     say "порт $p уже занят (pid $pid) — останавливаю"
@@ -80,72 +84,56 @@ echo $! > "$SERVER_PID"
 for i in $(seq 1 40); do alive "$GAME_PORT" && break; sleep 1; done
 alive "$GAME_PORT" || { echo "сервер не поднялся, лог /tmp/oasis-server.log" >&2; exit 1; }
 
-# ── 3. туннель сервера ────────────────────────────────────────────────────
-say "туннель сервера (TUNNEL=$TUNNEL)"
-WS_URL="$(start_tunnel "$GAME_PORT" "$SERVER_LOG")" || { echo "туннель сервера не выдал URL" >&2; exit 1; }
-WS_HOST="${WS_URL#https://}"
-say "  wss://$WS_HOST"
+# ── 3. туннель (страница и WebSocket на одном адресе) ─────────────────────
+say "туннель (TUNNEL=$TUNNEL)"
+URL="$(start_tunnel "$GAME_PORT" "$SERVER_LOG")" || { echo "туннель не выдал URL" >&2; exit 1; }
+HOST="${URL#https://}"
+say "  https://$HOST"
 
 # ── 4. сборка клиента под этот адрес ──────────────────────────────────────
 say "сборка клиента"
-printf 'VITE_SERVER_URL=wss://%s\n' "$WS_HOST" > packages/client/.env.production
+printf 'VITE_SERVER_URL=wss://%s\n' "$HOST" > packages/client/.env.production
 npm run build -w @oasis/client >/tmp/oasis-build.log 2>&1 || {
   echo "сборка упала, лог /tmp/oasis-build.log" >&2; exit 1;
 }
-if ! grep -qs "wss://$WS_HOST" packages/client/dist/assets/*.js; then
-  echo "в бандле нет wss://$WS_HOST — сборка не подхватила .env.production" >&2
+if ! grep -qs "wss://$HOST" packages/client/dist/assets/*.js; then
+  echo "в бандле нет wss://$HOST — сборка не подхватила .env.production" >&2
   exit 1
 fi
+# Сервер отдаёт dist сам, отдельная статика и второй туннель не нужны.
 
-# ── 5. статика + её туннель ───────────────────────────────────────────────
-say "статика на :$STATIC_PORT"
-nohup npx --yes serve -s packages/client/dist -l "$STATIC_PORT" >/tmp/oasis-static.log 2>&1 &
-echo $! > "$STATIC_PID"
-for i in $(seq 1 40); do alive "$STATIC_PORT" && break; sleep 1; done
-alive "$STATIC_PORT" || { echo "статика не поднялась" >&2; exit 1; }
-
-say "туннель клиента (TUNNEL=$TUNNEL)"
-CLIENT_URL="$(start_tunnel "$STATIC_PORT" "$CLIENT_LOG")" || { echo "туннель клиента не выдал URL" >&2; exit 1; }
-
-# ── 6. состояние ──────────────────────────────────────────────────────────
+# ── 5. состояние ──────────────────────────────────────────────────────────
 cat > "$STATE" <<EOF
-CLIENT_URL=$CLIENT_URL
-WS_URL=wss://$WS_HOST
+CLIENT_URL=https://$HOST
+WS_URL=wss://$HOST
 GAME_PORT=$GAME_PORT
-STATIC_PORT=$STATIC_PORT
+STATIC_PORT=-
+TUNNEL=$TUNNEL
 EOF
 
-sleep 5
-# Сначала обычный curl (pinggy резолвится локально), иначе — через 1.1.1.1
-# и --resolve: локальный резолвер не видит *.trycloudflare.com (та же беда,
-# что у cloudflared).
-HOST="${CLIENT_URL#https://}"
-CODE="$(curl -s -m 15 -o /dev/null -w '%{http_code}' "$CLIENT_URL/" || echo 000)"
-if [ "$CODE" != "200" ]; then
-  IP="$(node -e "
-    const dns=require('dns'); dns.setServers(['1.1.1.1']);
-    dns.resolve4('$HOST', (e,a)=>process.stdout.write(e?'':(a[0]||'')));
-  " 2>/dev/null || true)"
-  if [ -n "$IP" ]; then
-    CODE="$(curl -s -m 15 -o /dev/null -w '%{http_code}' --resolve "$HOST:443:$IP" "$CLIENT_URL/" || echo 000)"
-  else
-    CODE="000 (не удалось зарезолвить локально — проверьте снаружи)"
-  fi
-fi
-
-# ws: рукопожатие WebSocket через туннель (101 = туннель пропускает апгрейд)
-WS_CHECK="$(curl -s -m 15 -o /dev/null -w '%{http_code}' \
+sleep 3
+# Проверка снаружи. У pinggy и localtunnel браузер получает страницу-предупреждение
+# (511/200 с формой), поэтому обычный curl может вернуть и 200, и 511 — важно,
+# что сеть до хоста достаёт. Настоящая проверка — scripts/deploy-check.mjs.
+CODE="$(curl -s -m 15 -o /dev/null -w '%{http_code}' "$URL/" || true)"
+CODE="${CODE:-000}"
+# ws: рукопожатие WebSocket (101 = туннель пропускает апгрейд). curl по
+# умолчанию идёт по HTTP/2, там Connection: Upgrade вырезается — обязателен --http1.1.
+# После 101 curl сам ругается на оборванный ответ (тут нет тела) — код читаем
+# из -w, а статус выхода игнорируем, иначе к коду приклеивается «000».
+WS_CHECK="$(curl -s -m 15 --http1.1 -o /dev/null -w '%{http_code}' \
   -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
   -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
-  "https://$WS_HOST/" || echo 000)"
+  "$URL/" || true)"
+WS_CHECK="${WS_CHECK:-000}"
 
 say ""
-say "игра:  $CLIENT_URL"
-say "ws:    wss://$WS_HOST"
-say "статус клиента: HTTP $CODE"
-say "статус ws: HTTP $WS_CHECK (101 = ок)"
-if grep -q 'pinggy' "$CLIENT_LOG" 2>/dev/null; then
+say "игра:  $URL"
+say "ws:    wss://$HOST"
+say "страница: HTTP $CODE   ws: HTTP $WS_CHECK (101 = ок)"
+if grep -q 'pinggy' "$SERVER_LOG" 2>/dev/null; then
+  say "pinggy: первым игрокам нужно нажать «Enter site» на странице предупреждения"
   say "внимание: адрес туннеля живёт 60 минут, потом — повторный deploy.sh"
 fi
 say ""
-say "остановить: lsof -ti:$GAME_PORT,$STATIC_PORT | xargs -r kill -9; pkill -f 'cloudflared tunnel'; pkill -f 'a.pinggy.io'"
+say "остановить: lsof -ti:$GAME_PORT | xargs -r kill -9; pkill -f 'cloudflared tunnel'; pkill -f 'a.pinggy.io'"

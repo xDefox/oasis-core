@@ -8,8 +8,9 @@
  * туннель поднялся, HTTP отвечает, а WebSocket браузеру не проходит.
  *
  * Локальный DNS не резолвит *.trycloudflare.com (адрес провайдером режется),
- * поэтому хосты маппятся на рабочий anycast-адрес через --host-resolver-rules:
- * SNI от этого не меняется, TLS остаётся настоящим.
+ * поэтому для него хосты маппятся на рабочий anycast-адрес через
+ * --host-resolver-rules: SNI от этого не меняется, TLS остаётся настоящим.
+ * Остальные туннели (pinggy) резолвятся сами — их карта ломает сертификат.
  *
  * Запуск (после scripts/deploy.sh):
  *   node scripts/deploy-check.mjs                 # берёт адреса из .deploy-state
@@ -42,12 +43,21 @@ function fromState() {
 const fromArgs = process.argv[2] ? { client: process.argv[2], ws: process.argv[3] } : null;
 const { client, ws } = fromArgs?.client && fromArgs?.ws ? fromArgs : fromState();
 
-// Рабочие anycast-адреса Cloudflare (проверяется вручную, см. scripts/tunnel.sh).
+// Рабочие anycast-адреса Cloudflare нужны только для trycloudflare.com:
+// локальный DNS резолвит его в адрес, до которого соединение не доходит.
+// Остальные туннели (pinggy) резолвятся сами, и подменять их адрес нельзя —
+// сертификат хоста перестанет совпадать (ERR_CERT_COMMON_NAME_INVALID).
 const IP = process.env.CF_IP ?? '104.16.100.100';
+const needsHostMap = client.endsWith('.trycloudflare.com') || ws.endsWith('.trycloudflare.com');
+const resolverRules = needsHostMap
+  ? `--host-resolver-rules=MAP ${client} ${IP}, MAP ${ws} ${IP}`
+  : null;
 const URL = `https://${client}/`;
 const problems = [];
 
-console.log(`проверяю ${URL} (wss://${ws}, хост → ${IP})`);
+console.log(
+  `проверяю ${URL} (wss://${ws}${needsHostMap ? `, хост → ${IP}` : ', DNS без подмены'})`,
+);
 
 const browser = await puppeteer.launch({
   executablePath: process.env.CHROMIUM_PATH ?? '/usr/bin/chromium',
@@ -58,7 +68,7 @@ const browser = await puppeteer.launch({
     '--use-gl=angle',
     '--use-angle=swiftshader',
     '--enable-unsafe-swiftshader',
-    `--host-resolver-rules=MAP ${client} ${IP}, MAP ${ws} ${IP}`,
+    ...(resolverRules ? [resolverRules] : []),
   ],
 });
 
@@ -79,6 +89,24 @@ async function open(label) {
   });
 
   await page.goto(URL, { waitUntil: 'load', timeout: 60_000 });
+
+  // Бесплатные туннели (pinggy) вставляют страницу «Enter site»: одна кнопка
+  // ставит кукой согласие, после которой проходят и статика, и WebSocket.
+  // Без этого клика игра открылась бы, но не подключилась бы — ровно такая
+  // ошибка и была у людей на старом деплое.
+  const clicked = await page.evaluate(() => {
+    const button = [...document.querySelectorAll('button, a')].find((element) =>
+      /access\(\)|Enter site/i.test(element.outerHTML),
+    );
+    if (!button) return false;
+    button.click();
+    return true;
+  });
+  if (clicked) {
+    console.log(`[${label}] страница предупреждения туннеля — нажал «Enter site»`);
+    await page.waitForNavigation({ waitUntil: 'load', timeout: 30_000 }).catch(() => {});
+  }
+
   await page.waitForFunction(
     () => document.getElementById('status-text')?.textContent === 'в сети',
     { timeout: 45_000 },
