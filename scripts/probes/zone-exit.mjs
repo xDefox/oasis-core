@@ -5,8 +5,16 @@
  * на последнем месте — «призрак» с ником торчал в зоне. Теперь тело
  * прячется, как только владелец вышел из зоны или за радиус видимости.
  *
- * Walker идёт пешком до настоящего портала: `__oasisWarp` тут не годится —
- * клиент знает границы только своей зоны и такой хак обрезает по границе.
+ * Как уводим: тестовым хуком сервера `POST /debug/move` (нужен флаг
+ * `OASIS_TEST_HOOKS`, раннер его включает), а не пешим маршрутом до портала.
+ * Это осознанный выбор: зонд отвечает на вопрос «что происходит, когда игрок
+ * вышел из зоны», а не «можно ли пройти от спавна до портала». Второй вопрос
+ * умирал на каждом обновлении мира — маршрут был зашит координатами пропов,
+ * а пропы меняются (F1-16), и чек падал бы на живом коде.
+ *
+ * Клиентский `__oasisWarp` не годится вместо хука: он двигает только локальное
+ * предсказание и обрезается по границе своей зоны, сервер о переносе не
+ * узнаёт и сверкой возвращает игрока обратно.
  *
  * Запускается раннером (`npm run test:browser`), вручную — так:
  *   node scripts/probes/zone-exit.mjs http://localhost:5173
@@ -14,7 +22,10 @@
 
 import { debug, delay, launch, newPlayer, Problems } from './_probe.mjs';
 
-const PORTAL = { x: 26, z: 0 };
+/** Откуда зонд зовёт тестовый хук: тот же сервер, что и игра. */
+const SERVER =
+  process.env.OASIS_SERVER_URL ?? `http://localhost:${process.env.OASIS_SERVER_PORT ?? 2567}`;
+
 const problems = new Problems();
 const browser = await launch();
 
@@ -24,88 +35,86 @@ const walker = await newPlayer(browser, 'walker', problems);
 await delay(2500);
 
 await watcher.bringToFront();
-await delay(600);
+
+// Ждём ПОЯВЛЕНИЕ тела, а не спим фиксированное время.
+//
+// Однократный замер через 600 мс на быстрой машине видит тело, а в CI при
+// 3–15 fps там бывает непрокрученный кадр — зонд падал на живом коде
+// («наблюдатель должен видеть 1 тело, видит 0»). Тот же приём, что
+// `waitForTicks`: меряем состояние, а не часы.
+const sawWalker = await watcher
+  .waitForFunction(() => window.__oasisDebug().visibleOthers >= 1, {
+    timeout: 30_000,
+    polling: 200,
+  })
+  .then(() => true)
+  .catch(() => false);
+
 const before = await debug(watcher);
 console.log('до ухода:', { roster: before.roster, visibleOthers: before.visibleOthers });
 
-if (before.visibleOthers !== 1) {
+if (!sawWalker) {
   problems.add(`наблюдатель должен видеть 1 тело, видит ${before.visibleOthers}`);
 }
 
-// ── ведём walker к порталу, подруливая по фактической позиции ───────────
-// yaw = 0: W = −Z, S = +Z, D = +X, A = −X.
+// ── просим сервер увести игрока в другую зону ─────────────────────────────
 //
-// С F1-1 пропы реально блокируют: старая схема «всегда вперёд (D) + чинить z»
-// заворачивала walker под лавку и там умирал — движение вбок было невозможно,
-// а зонд проверял планировку, а не уход из зоны. Теперь подруливаем по обеим
-// осям, как в zone-unload: это тот же контроллер, что уже стабильно доносит
-// игрока до портала.
-await walker.bringToFront();
-await delay(400);
+// Зона выбирается сервером (первая, отличная от текущей), точка — центр её
+// bounds: зонд не знает про пропы и маршруты вообще. Роут без флага
+// OASIS_TEST_HOOKS не существует, поэтому прод-сервер на этот запрос молча
+// отдаст 404 — и зонд честно об этом скажет.
+const move = await fetch(`${SERVER}/debug/move`, {
+  method: 'POST',
+  headers: { 'content-type': 'application/json' },
+  body: JSON.stringify({ name: 'walker' }),
+})
+  .then(async (response) => ({ status: response.status, body: await response.json() }))
+  .catch((error) => ({ status: 0, body: { ok: false, error: String(error) } }));
 
-// Клавиши держим НЕПРЕРЫВНО и меняем только то, что реально изменилось.
-//
-// Цикл «всё отпустить → подождать → всё нажать» здесь не работает: спринт
-// даёт 8 м/с, а разворот при ускорении 28 м/с² занимает ~0.4 с — дольше
-// одного шага в 280 мс. В итоге каждый смена направления давала сетку
-// отрицательного прироста: walker «доворачивал» в старую сторону, уезжал
-// под лавку и там вставал намертво. С непрерывным вводом скорость
-// разворачивается в тике, пока клавиша ещё зажата.
-const held = new Set(['ShiftLeft']);
-await walker.keyboard.down('ShiftLeft');
+console.log('перенос:', move.body);
 
-async function setKeys(next) {
-  for (const key of [...held]) {
-    if (key !== 'ShiftLeft' && !next.includes(key)) {
-      await walker.keyboard.up(key);
-      held.delete(key);
-    }
-  }
-  for (const key of next) {
-    if (!held.has(key)) {
-      await walker.keyboard.down(key);
-      held.add(key);
-    }
+if (!move.body?.ok) {
+  problems.add(
+    `сервер не перенёс игрока (HTTP ${move.status}): ${move.body?.error ?? 'нет ответа'}`,
+  );
+}
+
+// Клиент должен применить S2C.Teleport: своя зона у walker'а меняется на
+// целевую. Без этого игрок мысленно остался бы в старом мире, а тело у
+// наблюдателя пропало бы по одной лишь серверной причине — проверка была бы
+// наполовину слепой.
+const destination = move.body?.to;
+if (destination) {
+  const applied = await walker
+    .waitForFunction(
+      (zoneId) => window.__oasisDebug().zone?.id === zoneId,
+      { timeout: 30_000, polling: 200 },
+      destination,
+    )
+    .then(() => true)
+    .catch(() => false);
+
+  if (!applied) {
+    const state = await debug(walker);
+    problems.add(`клиент walker не перешёл в зону ${destination}: осталась ${state.zone?.id}`);
   }
 }
 
-const startZone = (await debug(walker)).zone?.id ?? null;
-let reachedPortal = false;
-for (let step = 0; step < 60; step += 1) {
-  const state = await debug(walker);
-  // После F0-9 зона одна: признак перехода — смена zone.id, а не zoneGroups≥2.
-  if (startZone && state.zone?.id && state.zone.id !== startZone) {
-    reachedPortal = true;
-    break;
-  }
-
-  const dx = PORTAL.x - state.x;
-  const dz = PORTAL.z - state.z;
-  const keys = [];
-  if (dx > 0.6) keys.push('KeyD');
-  if (dx < -0.6) keys.push('KeyA');
-  if (dz > 0.6) keys.push('KeyS');
-  if (dz < -0.6) keys.push('KeyW');
-  if (keys.length === 0) keys.push('KeyD');
-
-  await setKeys(keys);
-  await delay(280);
-}
-
-await setKeys([]);
-await walker.keyboard.up('ShiftLeft');
-
-if (!reachedPortal) {
-  const state = await debug(walker);
-  problems.add(`walker не дошёл до портала: x=${state.x} z=${state.z}`);
-}
-
-await delay(1500);
-const walkerAfter = await debug(walker);
-console.log('walker ушёл:', { x: walkerAfter.x, z: walkerAfter.z, zoneGroups: walkerAfter.zoneGroups });
-
+// То же по телу: не «в момент замера», а «в итоге обязано пропасть».
+// На медленной машине кадр с ушедшим игроком ещё может доживать, когда
+// часы уже кончились, — это не баг, а опоздание рендера. Страница watcher'а
+// была в фоне, пока мы зовём хук: сначала возвращаем фокус, иначе рендер в
+// фоновой вкладке троттлится и ждать придётся до таймаута.
 await watcher.bringToFront();
-await delay(1500);
+
+const bodyGone = await watcher
+  .waitForFunction(() => window.__oasisDebug().visibleOthers === 0, {
+    timeout: 30_000,
+    polling: 200,
+  })
+  .then(() => true)
+  .catch(() => false);
+
 const after = await debug(watcher);
 console.log('после ухода:', {
   roster: after.roster,
@@ -113,12 +122,18 @@ console.log('после ухода:', {
   trackedOthers: after.trackedOthers,
 });
 
-if (after.visibleOthers !== 0) {
+if (!bodyGone) {
   problems.add(`тело ушедшего игрока осталось видимым: ${after.visibleOthers}`);
 }
 // Ростер — реестр мира, а не список видимых: игрок всё ещё в мире.
 if (after.roster !== 2) {
   problems.add(`ростер должен остаться из двух (он ещё в мире): ${after.roster}`);
+}
+
+const walkerAfter = await debug(walker);
+console.log('walker ушёл:', { zone: walkerAfter.zone?.id, roster: walkerAfter.roster });
+if (walkerAfter.roster !== 2) {
+  problems.add(`у ушедшего игрока ростер тоже должен остаться из двух: ${walkerAfter.roster}`);
 }
 
 await watcher.screenshot({ path: '/tmp/oasis-zone-exit.png' }).catch(() => {});
