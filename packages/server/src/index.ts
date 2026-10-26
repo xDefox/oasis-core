@@ -10,13 +10,15 @@
  */
 
 import http from 'node:http';
+import { existsSync } from 'node:fs';
+import path from 'node:path';
 
 import { Server } from '@colyseus/core';
 import { WebSocketTransport } from '@colyseus/ws-transport';
 import cors from 'cors';
 import express from 'express';
 
-import { config, logError, logInfo } from './config.ts';
+import { config, logError, logInfo, REPO_ROOT } from './config.ts';
 import { SectorRoom } from './rooms/SectorRoom.ts';
 import { createStore } from './store/index.ts';
 import { loadWorld } from './world/loadWorld.ts';
@@ -57,6 +59,28 @@ async function main(): Promise<void> {
       storage: store.kind,
       supply: await store.ledger.totalSupply(world.id),
       room: roomMetrics,
+    });
+  });
+
+  // Собранный клиент отдаёт тот же сервер, что и игру.
+  //
+  // Зачем деплою один туннель вместо двух: страница и WebSocket живут на одном
+  // домене, поэтому бесплатные туннели (pinggy) спрашивают разрешение на вход
+  // один раз, а не по адресу для каждой из двух ссылок. Dev-режим на это не
+  // реагирует: там клиент поднимает vite на 5173, а dist может не быть вовсе.
+  const clientDist = path.join(REPO_ROOT, 'packages', 'client', 'dist');
+  const clientIndex = path.join(clientDist, 'index.html');
+  const staticFiles = express.static(clientDist);
+  app.use((request, response, next) => {
+    if (request.method !== 'GET' && request.method !== 'HEAD') return next();
+    if (!existsSync(clientIndex)) return next();
+    staticFiles(request, response, (error) => {
+      if (error) return next(error);
+      // Файла в dist нет — отдаём index.html: у клиента нет своих маршрутов,
+      // но прямая ссылка или обновление страницы не должны ловить 404.
+      void response.sendFile(clientIndex, (sendError) => {
+        if (sendError) next(sendError);
+      });
     });
   });
 

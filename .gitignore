@@ -24,6 +24,8 @@ uploads/
 *.sqlite
 *.sqlite3
 *.db
+# состояние деплоя: адреса туннелей меняются при каждом запуске
+.deploy-state
 dump.rdb
 
 # --- Editors / OS ---
