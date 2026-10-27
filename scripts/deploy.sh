@@ -107,10 +107,37 @@ done
 
 # ── 2. игровой сервер ─────────────────────────────────────────────────────
 say "сервер на :$GAME_PORT"
+
+# Auth-lite (F0-6/F0-7) — два обязательных условия закрытия D-009:
+#
+#   OASIS_AUTH_SECRET — без него кука подписывается общим dev-ключом, который
+#     лежит в исходниках: подделать её сможет каждый, кто читал репозиторий.
+#     Секрет генерируется один раз и живёт в .env (он в .gitignore).
+#   NODE_ENV=production — «без валидной cookie не пускаем». Ровно это и есть
+#     D-009: без строгого режима клиент, который просто не отправил куку,
+#     всё ещё назвался бы любым accountId. Клиент берёт куку на
+#     GET /auth/session ДО подключения (main.ts: fetchServerSession → connect),
+#     так что штатный путь не меняется.
+#
+# Откат одной переменной, если на живом деплое что-то пойдёт не так:
+#   NODE_ENV=development scripts/deploy.sh
+AUTH_ENV="$ROOT/.env"
+if ! grep -qs '^OASIS_AUTH_SECRET=' "$AUTH_ENV"; then
+  node -e 'require("node:fs").appendFileSync(process.argv[1], "\nOASIS_AUTH_SECRET=" + require("node:crypto").randomBytes(32).toString("hex") + "\n")' "$AUTH_ENV"
+  say "  сгенерировал OASIS_AUTH_SECRET → .env (в git не попадает)"
+fi
+OASIS_AUTH_SECRET="$(grep '^OASIS_AUTH_SECRET=' "$AUTH_ENV" | head -1 | cut -d= -f2-)"
+export OASIS_AUTH_SECRET
+# NODE_ENV нужен только серверу: экспортировать его на весь скрипт нельзя —
+# тогда аварийный откат `NODE_ENV=development` пересобрал бы и клиент в
+# dev-режиме (vite берёт NODE_ENV из окружения), а ломать надо ровно одно.
+SERVER_NODE_ENV="${NODE_ENV:-production}"
+say "  auth-lite: NODE_ENV=$SERVER_NODE_ENV, подпись секретом из .env"
+
 # setsid — своя сессия у сервера: без неё процесс умирал вместе с родительской
 # командой (SIGHUP при выходе шелла), и деплой выглядел «сам упал».
 # Как у tunnel-pinggy.sh, где ssh так переживает закрытие шелла.
-setsid nohup node_modules/.bin/tsx packages/server/src/index.ts > /tmp/oasis-server.log 2>&1 &
+setsid nohup env NODE_ENV="$SERVER_NODE_ENV" node_modules/.bin/tsx packages/server/src/index.ts > /tmp/oasis-server.log 2>&1 &
 for i in $(seq 1 40); do alive "$GAME_PORT" && break; sleep 1; done
 alive "$GAME_PORT" || { echo "сервер не поднялся, лог /tmp/oasis-server.log" >&2; exit 1; }
 # PID из lsof, а не из $!: setsid может форкнуться, и $! тогда окажется его pid
