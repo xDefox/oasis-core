@@ -2,7 +2,8 @@
 # Один шаг: поднять сервер, туннель и собрать клиент под адрес туннеля.
 # Печатает ссылку для игроков.
 #
-#   scripts/deploy.sh                      # cloudflare, при сбое — pinggy
+#   scripts/deploy.sh                      # auto: serveo → cloudflare → pinggy
+#   TUNNEL=serveo scripts/deploy.sh        # F1-17: постоянный <имя>.serveousercontent.com
 #   TUNNEL=cloudflare scripts/deploy.sh    # принудительно cloudflare
 #   TUNNEL=pinggy scripts/deploy.sh        # принудительно pinggy
 #   node scripts/deploy-check.mjs          # проверить, что деплой играется
@@ -30,18 +31,26 @@ say() { printf '\033[1m%s\033[0m\n' "$*"; }
 
 alive() { lsof -ti:"$1" >/dev/null 2>&1; }
 
-# TUNNEL: auto | cloudflare | pinggy
-#   auto      — пробуем Cloudflare, через 15 с без URL переходим на pinggy
+# TUNNEL: auto | serveo | cloudflare | pinggy
+#   auto      — serveo, если есть ключ; иначе Cloudflare, через 15 с — pinggy
+#   serveo    — постоянный адрес <имя>.serveo.net: имя держится за SSH-ключом,
+#               между запусками не меняется (нужна однократная регистрация ключа)
 #   cloudflare— только trycloudflare.com (нужен доступ к api.trycloudflare.com)
 #   pinggy    — SSH-туннель pinggy.io (без аккаунта, адрес живёт 60 минут)
 TUNNEL="${TUNNEL:-auto}"
+SERVEO_KEY="${SERVEO_KEY:-$HOME/.ssh/serveo_key}"
+# Имя проверено 27.10: занятое (oasis, oasis-core) serveo отклоняет через
+# «remote port forwarding failed», свободное — резервирует за зарегистрированным
+# ключом. Чужой незарегистрированный ключ имя получить не может.
+SERVEO_SUBDOMAIN="${SERVEO_SUBDOMAIN:-oasis-play}"
 
 url_from() {
   local log="$1" wait="${2:-45}" i
   for i in $(seq 1 "$wait"); do
     local url
-    # оба бэкенда печатают https://<случайный-хост>
-    url="$(grep -oE 'https://[a-z0-9-]+\.(trycloudflare\.com|free\.pinggy\.net|pinggy-free\.link)' "$log" 2>/dev/null | grep -v 'api\.' | tail -1 || true)"
+    # все бэкенды печатают https://<хост>; console.serveo.net — не туннель,
+    # это ссылка на регистрацию ключа, её в URL не берём.
+    url="$(grep -oE 'https://[a-z0-9-]+\.(trycloudflare\.com|free\.pinggy\.net|pinggy-free\.link|serveo\.net|serveousercontent\.com)' "$log" 2>/dev/null | grep -vE 'api\.|console\.' | tail -1 || true)"
     if [ -n "$url" ]; then printf '%s' "$url"; return 0; fi
     sleep 1
   done
@@ -51,6 +60,25 @@ url_from() {
 # start_tunnel <порт> <лог> → печатает URL туннеля
 start_tunnel() {
   local port="$1" log="$2" url
+
+  # F1-17: постоянный адрес — serveo первым, если есть ключ
+  if [ "$TUNNEL" = "serveo" ] || { [ "$TUNNEL" = "auto" ] && [ -f "$SERVEO_KEY" ]; }; then
+    : > "$log"
+    # Старый туннель держит имя: без его остановки новый ssh получает
+    # «remote port forwarding failed for listen port 80» и деплой падает.
+    # Для pinggy этого не было — там адрес каждый раз свой.
+    pkill -f 'ssh .*serveo\.net' 2>/dev/null || true
+    sleep 1
+    nohup bash scripts/tunnel-serveo.sh "$port" "$log" "$SERVEO_SUBDOMAIN" >/dev/null 2>&1 &
+    if url="$(url_from "$log" 20)"; then printf '%s' "$url"; return 0; fi
+    if [ "$TUNNEL" = "serveo" ]; then
+      # причина отказа — например, «remote port forwarding failed» (имя занято)
+      echo "  serveo не поднялся: $(tr -d '\033' < "$log" | head -1)" >&2
+      return 1
+    fi
+    echo "  serveo не дал URL — пробую дальше" >&2
+    pkill -f 'ssh .*serveo\.net' 2>/dev/null || true
+  fi
 
   if [ "$TUNNEL" != "pinggy" ]; then
     : > "$log"
@@ -79,10 +107,14 @@ done
 
 # ── 2. игровой сервер ─────────────────────────────────────────────────────
 say "сервер на :$GAME_PORT"
-nohup node_modules/.bin/tsx packages/server/src/index.ts > /tmp/oasis-server.log 2>&1 &
-echo $! > "$SERVER_PID"
+# setsid — своя сессия у сервера: без неё процесс умирал вместе с родительской
+# командой (SIGHUP при выходе шелла), и деплой выглядел «сам упал».
+# Как у tunnel-pinggy.sh, где ssh так переживает закрытие шелла.
+setsid nohup node_modules/.bin/tsx packages/server/src/index.ts > /tmp/oasis-server.log 2>&1 &
 for i in $(seq 1 40); do alive "$GAME_PORT" && break; sleep 1; done
 alive "$GAME_PORT" || { echo "сервер не поднялся, лог /tmp/oasis-server.log" >&2; exit 1; }
+# PID из lsof, а не из $!: setsid может форкнуться, и $! тогда окажется его pid
+echo "$(lsof -ti:"$GAME_PORT" | head -1)" > "$SERVER_PID"
 
 # ── 3. туннель (страница и WebSocket на одном адресе) ─────────────────────
 say "туннель (TUNNEL=$TUNNEL)"
@@ -131,9 +163,29 @@ say ""
 say "игра:  $URL"
 say "ws:    wss://$HOST"
 say "страница: HTTP $CODE   ws: HTTP $WS_CHECK (101 = ок)"
+# Имя проверено 27.10: у зарегистрированного ключа serveo отдаёт
+# <имя>.serveousercontent.com (домен совпадает со случайным!),
+# поэтому «постоянность» определяется по имени, а не по домену.
+if [ "$HOST" = "$SERVEO_SUBDOMAIN.serveousercontent.com" ] ||
+   [ "$HOST" = "$SERVEO_SUBDOMAIN.serveo.net" ]; then
+  say "serveo: адрес постоянный — имя «$SERVEO_SUBDOMAIN» закреплено за ключом"
+  say "        тот же адрес будет и при следующем запуске deploy.sh"
+elif [ "$TUNNEL" = "serveo" ]; then
+  # имя не совпало: ключ не зарегистрирован (serveo игнорирует имя и даёт
+  # <хеш>-<ip>) либо имя заняли — печатаем, как зарегистрировать ключ
+  say "serveo: постоянное имя не получилось — адрес $HOST не сохранится"
+  say "        регистрация ключа (один раз, вход через Google/GitHub):"
+  fp="$(ssh-keygen -lf "$SERVEO_KEY.pub" 2>/dev/null | awk '{print $2}')" || fp=""
+  if [ -n "${fp:-}" ]; then
+    add="$(printf '%s' "$fp" | sed -e 's/:/%3A/g' -e 's#/#%2F#g' -e 's/+/%2B/g')"
+    say "        https://console.serveo.net/ssh/keys?add=$add"
+  else
+    say "        ключ $SERVEO_KEY не найден: ssh-keygen -t ed25519 -f $SERVEO_KEY -N ''"
+  fi
+fi
 if grep -q 'pinggy' "$SERVER_LOG" 2>/dev/null; then
   say "pinggy: первым игрокам нужно нажать «Enter site» на странице предупреждения"
   say "внимание: адрес туннеля живёт 60 минут, потом — повторный deploy.sh"
 fi
 say ""
-say "остановить: lsof -ti:$GAME_PORT | xargs -r kill -9; pkill -f 'cloudflared tunnel'; pkill -f 'a.pinggy.io'"
+say "остановить: lsof -ti:$GAME_PORT | xargs -r kill -9; pkill -f 'cloudflared tunnel'; pkill -f '[a].pinggy.io'; pkill -f '[s]erveo.net'"
