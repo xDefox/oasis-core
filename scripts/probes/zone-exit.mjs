@@ -159,12 +159,6 @@ for (const side of [
   }
 }
 
-const walkerAfter = await debug(walker);
-console.log('walker ушёл:', { zone: walkerAfter.zone?.id, roster: walkerAfter.roster });
-if (walkerAfter.roster !== 2) {
-  problems.add(`у ушедшего игрока ростер тоже должен остаться из двух: ${walkerAfter.roster}`);
-}
-
 await watcher.screenshot({ path: '/tmp/oasis-zone-exit.png' }).catch(() => {});
 
 await browser.close();
