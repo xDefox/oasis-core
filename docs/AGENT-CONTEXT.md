@@ -44,8 +44,19 @@
 - F1-3, F1-4, F1-8: интерполяция чужих, анимация аватара, онбординг
 - F1-10: `scripts/deploy.sh` — публичный доступ одной командой (туннель
   cloudflared, без VPS и домена), PR #8
-- CI: `typecheck + tests`, `мутации (тесты не врут?)`, `headless-мир`
-  (5 браузерных зондов). Все три — обязательные чеки в branch protection.
+- F1-19: коллизии по высоте — шаг вверх, опора на пропах, присед,
+  ветка `feat/f1-19-collisions`, PR #13
+- F1-16 + F1-20: мир под коллизии и автопроверка мира. Правила —
+  `src/world/worldCheck.ts` (зазор ≥1 м или 0, диск портала, точка
+  прибытия, кольцо спавна), генератор подчиняется (`repairGaps`),
+  CI гоняет `scripts/world-check.ts` по закоммиченному `world.json`;
+  333 → 324 пропа, ловушек 0 (было 58), забитых порталов 0 (было 4) —
+  ветка `feat/f1-16-world`, PR #14
+- CI: `typecheck + tests`, `проверка мира`, `мутации (тесты не врут?)`,
+  `headless-мир` (5 браузерных зондов). Все — обязательные чеки
+  в branch protection.
+
+Ближайшие задачи и их порядок — `11-work-plan.md`, §4.4.
 
 Ближайшие задачи и их порядок — `11-work-plan.md`, §4.4.
 
@@ -84,5 +95,11 @@
 - `packages/server/src/auth/session.ts` — подпись/проверка сессии
 - `packages/client/src/net/LocalPlayer.ts` — предсказание и сверка
 - `packages/client/src/net/frameDelta.ts` — потолок кадра
+- `packages/server/src/world/worldCheck.ts` — правила мира (зазор, портал,
+  точка прибытия, кольцо спавна); их читают и генератор, и CI
+- `packages/server/src/world/buildWorld.ts` + `scripts/generate-world.ts` —
+  сборка мира из seed; `content/default/world.json` руками не правится
+  (CI сверяет с выводом генератора)
 - `scripts/load-bots.mjs` — нагрузочный тест
+- `scripts/world-check.ts` — CLI-проверка мира (шаг CI `проверка мира`)
 - `scripts/browser-test.mjs`, `scripts/probes/*` — браузерные зонды

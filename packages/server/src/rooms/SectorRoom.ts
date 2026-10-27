@@ -67,6 +67,7 @@ import {
 import { logInfo, logWarn } from '../config.ts';
 import type { Ledger } from '../store/ledger.ts';
 import { findZone, zoneAt } from '../world/loadWorld.ts';
+import { spawnPoint } from '../world/spawnPoint.ts';
 
 interface SessionInput {
   seq: number;
@@ -142,8 +143,6 @@ const ZONE_REQUEST_COOLDOWN_MS = 250;
  * закрывается сама через этот таймаут.
  */
 const ROOM_IDLE_MS = 10_000;
-/** Радиус кольца спавна: игроки не появляются друг в друге. */
-const SPAWN_RADIUS = 1.2;
 /**
  * Сколько место держится за игроком после обрыва связи.
  *
@@ -1146,22 +1145,4 @@ function hashSeed(value: string): number {
   return hash;
 }
 
-/**
- * Точка спавна со сдвигом по «золотому углу». Без него все появляются
- * в одной точке и стоят друг в друге. Сид берётся из имени, поэтому
- * один и тот же игрок всегда появляется в одном месте.
- */
-function spawnPoint(base: { x: number; y: number; z: number }, seed: number): {
-  x: number;
-  y: number;
-  z: number;
-} {
-  if (seed === 0) return base;
-  const angle = seed * 2.399963;
-  const radius = SPAWN_RADIUS * Math.sqrt(1 + (seed % 8));
-  return {
-    x: base.x + Math.cos(angle) * radius,
-    y: base.y,
-    z: base.z + Math.sin(angle) * radius,
-  };
-}
+

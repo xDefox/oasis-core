@@ -187,6 +187,50 @@ const MUTATIONS = [
     to: '      const vertical = stepVertical(session.y, session.vy, wantJump, crouch, dt);',
     expect: 'сервер ставит игрока на ступеньку',
   },
+
+  {
+    name: 'щель между пропами не считается ловушкой',
+    file: 'packages/server/src/world/worldCheck.ts',
+    from: '        if (gap > CONTACT_EPS && gap < GAP_MIN) traps.push(`${shortId(a.id)}↔${shortId(b.id)} ${gap.toFixed(2)} м`);',
+    to: '        if (false) traps.push(`мутация: щель не считается`);',
+    expect: 'щель-ловушка между двумя пропами',
+  },
+  {
+    name: 'диск портала не защищён',
+    file: 'packages/server/src/world/worldCheck.ts',
+    from: '      radius: portal.radius + PLAYER_RADIUS,',
+    to: '      radius: 0,',
+    expect: 'проп в диске портала',
+  },
+  {
+    name: 'точка прибытия не защищена',
+    file: 'packages/server/src/world/worldCheck.ts',
+    from: '      radius: ARRIVAL_CLEAR,',
+    to: '      radius: 0,',
+    expect: 'проп в точке прибытия из портала',
+  },
+  {
+    name: 'кольцо спавна не защищено',
+    file: 'packages/server/src/world/worldCheck.ts',
+    from: '      radius: SPAWN_RING_MAX + PLAYER_RADIUS,',
+    to: '      radius: 0,',
+    expect: 'проп в кольце спавна',
+  },
+  {
+    name: 'генератор не раздвигает ловушки',
+    file: 'packages/server/src/world/repairGaps.ts',
+    from: '      if (openGap < GAP_MIN) traps.push({ a, b, gap: openGap });',
+    to: '      if (false) traps.push({ a: units[0], b: units[1], gap: 0 });',
+    expect: 'генератор собирает мир без ловушек',
+  },
+  {
+    name: 'генератор строит в запретных кругах',
+    file: 'packages/server/src/world/procedural.ts',
+    from: '    return Math.hypot(dx, dz) >= options.clearRadius && !inClearing(prop);',
+    to: '    return Math.hypot(dx, dz) >= options.clearRadius;',
+    expect: 'генератор собирает мир без ловушек',
+  },
+
 ];
 
 async function runTests() {
