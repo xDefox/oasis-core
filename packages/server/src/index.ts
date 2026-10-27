@@ -20,7 +20,7 @@ import express from 'express';
 
 import { config, logError, logInfo, REPO_ROOT } from './config.ts';
 import { handleSession } from './http/session.ts';
-import { SectorRoom, sectorRooms } from './rooms/SectorRoom.ts';)
+import { SectorRoom, sectorRooms } from './rooms/SectorRoom.ts';
 import { createStore } from './store/index.ts';
 import { loadWorld } from './world/loadWorld.ts';
 

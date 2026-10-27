@@ -54,7 +54,11 @@ function verifySigned(signed: string): SessionPayload | null {
   const [body, sig] = parts;
   if (!body || !sig) return null;
 
-  const expected = Buffer.from(sign(body));
+  // Обе стороны — base64url одной и той же подписи, поэтому декодируем
+  // одинаково. Buffer.from(str) без кодировки дал бы UTF-8 байты строки
+  // (43 шт.) против 32 декодированных: lengths не сошлись бы никогда и
+  // каждая сессия отваливалась бы.
+  const expected = base64urlDecode(sign(body));
   const got = base64urlDecode(sig);
   if (expected.length !== got.length) return null;
   try {
