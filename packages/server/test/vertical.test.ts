@@ -142,6 +142,8 @@ describe('вертикальный срез: два игрока видят др
   let portalWorld: Awaited<ReturnType<typeof loadWorld>>;
   /** Мир для теста видимости: спавн вне портала, но зоны граничат близко. */
   let aoiWorld: Awaited<ReturnType<typeof loadWorld>>;
+  /** Мир для теста опоры F1-19: на пути от спавна стоит ступенька 0.3 м. */
+  let stepWorld: Awaited<ReturnType<typeof loadWorld>>;
 
   before(async () => {
     world = await loadWorld(config.worldPath);
@@ -181,6 +183,24 @@ describe('вертикальный срез: два игрока видят др
     // «ушёл далеко» исключено, и тест проверяет ровно правило зоны.
     aoiWorld.sectors[0]!.spawn = { x: 0, y: 0, z: 0 };
 
+    // F1-19: ступенька 0.3 м ровно на пути от спавна на восток. Спавн
+    // случайный на кольце радиуса 1.2·3 (spawnPoint), поэтому ступенька
+    // широкая и в z, и в x: попадает в любую точку кольца. Участок
+    // x∈[-4.5,0.5] × z∈5..15 в мире пуст — игрока ничего не собьёт.
+    stepWorld = structuredClone(world);
+    stepWorld.zones[0]!.props.push({
+      ...stepWorld.zones[0]!.props[0]!,
+      id: 'z_plaza:step',
+      type: 'box',
+      x: -1,
+      y: 0.15,
+      z: 10,
+      sx: 2.5,
+      sy: 0.15,
+      sz: 5,
+      rot: 0,
+    });
+
     const ledger = new MemoryLedger();
     const httpServer = http.createServer();
     gameServer = new Server({
@@ -193,6 +213,7 @@ describe('вертикальный срез: два игрока видят др
       maxPlayers: 16,
     });
     gameServer.define('sector_aoi', SectorRoom, { world: aoiWorld, ledger, maxPlayers: 16 });
+    gameServer.define('sector_step', SectorRoom, { world: stepWorld, ledger, maxPlayers: 4 });
     // Короткий резерв: проверять истечение 30 секунд в тесте — плохая идея.
     gameServer.define('sector_resume', SectorRoom, {
       world,
@@ -613,6 +634,63 @@ describe('вертикальный срез: два игрока видят др
     assert.ok(
       after !== undefined && Math.abs(after - settled) < 0.5,
       `игрок с мёртвым вводом продолжает ехать: x=${settled} → ${after} (ждали остановки)`,
+    );
+
+    await room.leave();
+  });
+
+  it('F1-19: сервер ставит игрока на ступеньку той же опорой, что клиент', async () => {
+    // Клиент и сервер обязаны считать высоту опоры одинаково: как только
+    // это разойдётся, предсказание начинает дёргаться на каждой ступеньке.
+    // На пути от кольца спавна на восток лежит ступенька 0.3 м — в пределах
+    // шага вверх, поэтому её берут ногой, а не прыжком.
+    const client = new Client(`ws://localhost:${PORT}`);
+    const { room, record } = await joinWorld(
+      client,
+      {
+        accountId: 'acct_step_000000000001',
+        accountCreatedAt: Date.now() - 5 * 24 * 60 * 60 * 1000,
+        name: 'step',
+      },
+      'sector_step',
+    );
+    await waitFor(() => record.welcome, 8000, 'welcome');
+
+    room.sendBytes(BIN_CHANNEL, encodeInput({ seq: 1, dirX: 1, dirZ: 0, yaw: 0, sprint: true }));
+    // Спавн может быть в 8.6 м от ступеньки, а ввод живёт до TTL (1 с):
+    // продлеваем его вторым сообщением, иначе тест меряет удачу спавна.
+    await delay(500);
+    room.sendBytes(BIN_CHANNEL, encodeInput({ seq: 2, dirX: 1, dirZ: 0, yaw: 0, sprint: true }));
+
+    const ownState = (): { x: number; y: number; z: number }[] => {
+      const values: { x: number; y: number; z: number }[] = [];
+      const apply = (entities: EntityState[]): void => {
+        for (const entity of entities) {
+          if (entity.id === record.welcome?.playerId) {
+            values.push({ x: entity.x, y: entity.y, z: entity.z });
+          }
+        }
+      };
+      for (const snapshot of record.snapshots) apply(snapshot.entities);
+      for (const delta of record.deltas) apply(delta.changed);
+      return values;
+    };
+
+    // Ждём сам подъём, а не финальную точку: одного ввода хватает, чтобы
+    // ступеньку пересечь, и игрок падает обратно на пол — финальное y
+    // ничего не доказало бы.
+    const deadline = Date.now() + 3000;
+    while (Date.now() < deadline && !ownState().some((state) => state.y >= 0.25)) {
+      await delay(50);
+    }
+
+    const trail = ownState();
+    const reached = trail.reduce((max, state) => Math.max(max, state.y), 0);
+    assert.ok(
+      reached >= 0.25,
+      `сервер не поднял игрока на ступеньку: max y=${reached}, ` +
+        `финальная точка (${trail.at(-1)?.x}, ${trail.at(-1)?.z}), ` +
+        `сэмплов ${trail.length}, y: ${trail.map((s) => s.y.toFixed(2)).join(',')}`,
     );
 
     await room.leave();

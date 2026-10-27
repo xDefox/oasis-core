@@ -159,6 +159,34 @@ const MUTATIONS = [
     to: '  private findResumable(hello: HelloMsg): Session | undefined {\n    if (hello.resume) {\n      const byToken = this.resumeTokens.get(hello.resume);\n      if (byToken) {\n        if (byToken.disconnectedAt === null) return undefined;\n        if (byToken.accountId !== hello.accountId) {\n          logWarn(\'токен возобновления от другого аккаунта\', {\n            token: hello.resume.slice(0, 8),\n          });\n          return undefined;\n        }\n        return byToken;\n      }\n    }',
     expect: 'забирает своё место у живого соединения',
   },
+  {
+    name: 'шаг вверх игнорируется: низкий проп блокирует всегда',
+    file: 'packages/protocol/src/collision.ts',
+    from: '  return collider.y1 > feetY + stepUp && collider.y0 < feetY + height;',
+    to: '  return collider.y0 < feetY + height;',
+    expect: 'бордюр 0.3 м проходится ногой',
+  },
+  {
+    name: 'высота тела игнорируется: крона над головой — стена',
+    file: 'packages/protocol/src/collision.ts',
+    from: '  return collider.y1 > feetY + stepUp && collider.y0 < feetY + height;',
+    to: '  return collider.y1 > feetY + stepUp;',
+    expect: 'конус над головой не блокирует',
+  },
+  {
+    name: 'опора всегда пол: на проп не поднимает',
+    file: 'packages/protocol/src/collision.ts',
+    from: '  return best;\n}',
+    to: '  return GROUND_Y; // мутация: опора не считается\n}',
+    expect: 'опора меряется по центру ноги',
+  },
+  {
+    name: 'сервер не передаёт высоту опоры в stepVertical',
+    file: 'packages/server/src/rooms/SectorRoom.ts',
+    from: '      const vertical = stepVertical(session.y, session.vy, wantJump, crouch, dt, groundY);',
+    to: '      const vertical = stepVertical(session.y, session.vy, wantJump, crouch, dt);',
+    expect: 'сервер ставит игрока на ступеньку',
+  },
 ];
 
 async function runTests() {

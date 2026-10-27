@@ -9,11 +9,14 @@
 
 import {
   GROUND_Y,
+  PLAYER_CROUCH_HEIGHT,
+  PLAYER_HEIGHT,
   PLAYER_RADIUS,
   clampToBounds,
   resolvePlayerMove,
   stepVelocity,
   stepVertical,
+  supportHeightAt,
   type EntityState,
   type ZoneBounds,
   type ZoneColliders,
@@ -182,7 +185,12 @@ export class LocalPlayer {
     this.applyMotion(this.vx * dt, this.vz * dt);
 
     const wantJump = this.jumpBuffer > 0;
-    const vertical = stepVertical(this.y, this.vy, wantJump, this.crouch, dt);
+    // Высота опоры под ногами (F1-19): то же число, что считает сервер,
+    // иначе на ступеньках предсказание начнёт отставать и дёргаться.
+    const groundY = this.colliders
+      ? supportHeightAt(this.x, this.z, this.colliders, this.y)
+      : GROUND_Y;
+    const vertical = stepVertical(this.y, this.vy, wantJump, this.crouch, dt, groundY);
     this.y = vertical.y;
     this.vy = vertical.vy;
     if (vertical.jumped || this.jumpBuffer > 0) {
@@ -210,7 +218,10 @@ export class LocalPlayer {
     dz: number,
   ): { x: number; z: number; blockedX: boolean; blockedZ: boolean } {
     if (this.colliders) {
-      return resolvePlayerMove(x, z, dx, dz, this.colliders, PLAYER_RADIUS);
+      return resolvePlayerMove(x, z, dx, dz, this.colliders, {
+        feetY: this.y,
+        height: this.crouch ? PLAYER_CROUCH_HEIGHT : PLAYER_HEIGHT,
+      });
     }
     const nextX = x + dx;
     const nextZ = z + dz;
