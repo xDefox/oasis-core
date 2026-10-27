@@ -61,6 +61,20 @@ export class StateStore {
     for (const player of players) this.roster.set(player.id, player);
   }
 
+  /**
+   * Полный сброс перед возобновлением сессии.
+   *
+   * После обрыва старые сэмплы описывают прошлую сессию: интерполяция
+   * потянет тело из точки, где игрок был до обрыва, в точку, где он
+   * появился. Ростер тоже перезапрашивается — сервер пришлёт его заново.
+   */
+  reset(): void {
+    this.samples.clear();
+    this.roster.clear();
+    this.localPlayerId = 0;
+    this.lastTick = 0;
+  }
+
   private pushSample(entity: EntityState, now: number): void {
     let buffer = this.samples.get(entity.id);
     if (!buffer) {

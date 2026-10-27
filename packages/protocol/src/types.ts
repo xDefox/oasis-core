@@ -140,6 +140,11 @@ export interface HelloMsg {
   accountCreatedAt: number;
   /** Ник игрока. */
   name: string;
+  /**
+   * Токен возобновления из прошлого `welcome`. Нет токена — вход заново
+   * (новое место, спавн, возможно суффикс в нике).
+   */
+  resume?: string;
 }
 
 export interface InputMsg {
@@ -185,11 +190,23 @@ export interface WelcomeMsg {
   name: string;
   /** Идентификатор сессии Colyseus (для reconnect). */
   sessionId: string;
+  /**
+   * Токен, по которому сервер узнаёт наше место после обрыва или
+   * перезагрузки страницы. Живёт в sessionStorage вкладки: соседняя вкладка
+   * того же браузера — это другой игрок, а не тот же.
+   */
+  resumeToken: string;
+  /** true — вернулись на прежнее место; false — вошли заново. */
+  resumed: boolean;
   world: WorldHeader;
   sectorId: string;
   tickRate: number;
   snapshotRate: number;
   aoiRadius: number;
+  /**
+   * Точка, в которой клиент начинает предсказание. При обычном входе — точка
+   * спавна, при возобновлении — место, где игрок пропал.
+   */
   spawn: Vec3;
   balance: number;
 }

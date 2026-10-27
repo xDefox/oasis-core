@@ -59,6 +59,11 @@ export async function launch({ width = 1280, height = 720 } = {}) {
       '--use-gl=angle',
       '--use-angle=swiftshader',
       '--enable-unsafe-swiftshader',
+      // Вкладка в фоне получает и троттлинг rAF, и blur на window —
+      // Input.ts чистит клавиши, и зонд «молчит», хотя кнопки нажаты.
+      '--disable-background-timer-throttling',
+      '--disable-backgrounding-occluded-windows',
+      '--disable-renderer-backgrounding',
       `--window-size=${width},${height}`,
     ],
   });
@@ -95,6 +100,7 @@ export async function newPlayer(browser, name, problems, { accountAgeDays = 30 }
   await page.evaluate(
     ({ nick, ageDays }) => {
       window.localStorage.clear();
+      window.sessionStorage.clear();
       window.localStorage.setItem(
         'oasis.account',
         JSON.stringify({

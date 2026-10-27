@@ -12,6 +12,8 @@
  * Протокол и сектор разделены: всё, что не касается симуляции, живёт в ядре.
  */
 
+import { randomUUID } from 'node:crypto';
+
 import type { Client } from '@colyseus/core';
 import { Room } from '@colyseus/core';
 
@@ -26,6 +28,9 @@ import {
   GENESIS_ACCOUNT_MIN_AGE_MS,
   GENESIS_FRESH_ACCOUNT_FACTOR,
   GENESIS_GRANT,
+  GROUND_Y,
+  PLAYER_CROUCH_HEIGHT,
+  PLAYER_HEIGHT,
   PLAYER_RADIUS,
   PROTOCOL_VERSION,
   S2C,
@@ -41,6 +46,7 @@ import {
   speedOf,
   stepVelocity,
   stepVertical,
+  supportHeightAt,
   type EntityState,
   type HelloMsg,
   type PlayerInfo,
@@ -105,12 +111,18 @@ interface Session {
   lastInputAt: number;
   lastZoneRequestAt: number;
   lastChatErrorAt: number;
+  /** Токен, по которому игрок возвращается на это место. */
+  resumeToken: string;
+  /** Когда пропала связь; null — игрок на связи. */
+  disconnectedAt: number | null;
 }
 
 export interface SectorRoomOptions {
   world: WorldDef;
   ledger: Ledger;
   maxPlayers?: number;
+  /** Сколько держать место после обрыва. В тестах уменьшают, чтобы не ждать. */
+  resumeGraceMs?: number;
 }
 
 /** Сколько ждём `hello` после подключения. */
@@ -121,8 +133,24 @@ const PORTAL_COOLDOWN_MS = 1_200;
 const INPUT_TTL_MS = 1_000;
 /** Не чаще одного запроса зоны в 250 мс (зона весит десятки килобайт JSON). */
 const ZONE_REQUEST_COOLDOWN_MS = 250;
+/**
+ * Сколько живёт комната без единого игрока.
+ *
+ * `autoDispose` выключен: иначе последний ушедший игрок уносит с собой и своё
+ * зарезервированное место — то есть ровно тот случай, который нужно
+ * пережить (единственный игрок перезагружает страницу). Пустая комната
+ * закрывается сама через этот таймаут.
+ */
+const ROOM_IDLE_MS = 10_000;
 /** Радиус кольца спавна: игроки не появляются друг в друге. */
 const SPAWN_RADIUS = 1.2;
+/**
+ * Сколько место держится за игроком после обрыва связи.
+ *
+ * 30 с — это «перезагрузил страницу», «уснул ноутбук», «прыгнул Wi-Fi».
+ * Дольше держать нельзя: ник и место заняты, а человек может и не вернуться.
+ */
+const DEFAULT_RESUME_GRACE_MS = 30_000;
 
 const PLAYER_COLORS = [
   0x4fa3ff, 0xff7a59, 0x6fcf7f, 0xffd166, 0xc792ea, 0x59d4d4, 0xff8fa3, 0x9ad36f,
@@ -147,6 +175,12 @@ export class SectorRoom extends Room {
   private maxPlayers = 64;
 
   private readonly sessions = new Map<string, Session>();
+  /**
+   * Места, которые держим за игроком после обрыва: токен → сессия.
+   * Пока место здесь, ник занят, тело стоит в мире, ввод не читается.
+   */
+  private readonly resumeTokens = new Map<string, Session>();
+  private resumeGraceMs = DEFAULT_RESUME_GRACE_MS;
   /** Подключились, но ещё не прислали hello — сущности пока нет. */
   private readonly pending = new Map<string, HelloMsg>();
   /**
@@ -159,6 +193,8 @@ export class SectorRoom extends Room {
   private readonly zoneColliders = new Map<string, ZoneColliders>();
   private nextEntityId = 1;
   private tick = 0;
+  /** С какого момента в комнате нет ни одного игрока. */
+  private idleSince: number | null = null;
 
   // ── метрики для F0-10/F0-11 ──────────────────────────────────────────
   private tickDurations: number[] = [];
@@ -172,8 +208,13 @@ export class SectorRoom extends Room {
     this.world = options.world;
     this.ledger = options.ledger;
     this.maxPlayers = options.maxPlayers ?? 64;
+    this.resumeGraceMs = options.resumeGraceMs ?? DEFAULT_RESUME_GRACE_MS;
     // Matchmaking должен отказывать сам, а не пускать и потом выкидывать.
     this.maxClients = this.maxPlayers;
+    // Пустая комната не должна исчезать мгновенно: в ней может остаться
+    // место, зарезервированное за игроком, который вот-вот вернётся.
+    this.autoDispose = false;
+    this.idleSince = null;
 
     this.zoneColliders.clear();
     for (const zone of this.world.zones) {
@@ -350,7 +391,10 @@ export class SectorRoom extends Room {
       return;
     }
 
-    if (this.sessions.size + this.pending.size >= this.maxPlayers) {
+    // Возвращающийся игрок занимает своё же место: место уже посчитано в
+    // sessions, и отказ «сектор заполнен» был бы издевательством.
+    const returning = hello.resume !== undefined && this.resumeTokens.has(hello.resume);
+    if (!returning && this.sessions.size + this.pending.size >= this.maxPlayers) {
       client.send(S2C.Error, { code: 'SECTOR_FULL', message: 'Сектор заполнен' });
       client.leave(4001, 'отказано в подключении');
       return;
@@ -367,6 +411,10 @@ export class SectorRoom extends Room {
 
   /** Создаёт игрока и отправляет ему мир. Вызывается после `hello`. */
   private async activateSession(client: Client, hello: HelloMsg): Promise<void> {
+    // Возврат на прежнее место — до всего остального: спавн, цвет и ник
+    // восстанавливаются из сессии, а не выдаются заново.
+    if (this.resume(client, hello)) return;
+
     const sector = this.world.sectors[0];
     if (!sector) {
       client.send(S2C.Error, { code: 'NO_SECTOR', message: 'В мире нет ни одного сектора' });
@@ -418,8 +466,14 @@ export class SectorRoom extends Room {
       lastInputAt: 0,
       lastZoneRequestAt: 0,
       lastChatErrorAt: 0,
+      resumeToken: randomUUID(),
+      disconnectedAt: null,
     };
     this.sessions.set(sessionId, session);
+    // Токен живёт в реестре всё время, пока место существует: иначе по нему
+    // нельзя было бы забрать место у ещё не признанного мёртвым сокета
+    // (сон/пробуждение, гонка при перезагрузке страницы).
+    this.resumeTokens.set(session.resumeToken, session);
 
     this.entities.set(entityId, {
       id: entityId,
@@ -462,6 +516,8 @@ export class SectorRoom extends Room {
       aoiRadius: AOI_RADIUS,
       spawn,
       balance: session.balance,
+      resumeToken: session.resumeToken,
+      resumed: false,
     };
     session.welcome = welcome;
     client.send(S2C.Welcome, welcome);
@@ -475,15 +531,156 @@ export class SectorRoom extends Room {
     });
   }
 
-  override async onLeave(client: Client): Promise<void> {
+  /**
+   * Связь пропала без согласия клиента: обрыв, спящий ноутбук, краш вкладки.
+   *
+   * Место не отдаём сразу. Игрок вернётся (по токену или тем же аккаунтом)
+   * и окажется там, где пропал. Всё это время тело стоит на месте: для
+   * остальных он «замер», а не исчез, и ник остаётся занятым.
+   */
+  override onDrop(client: Client): void {
+    const session = this.sessions.get(client.sessionId);
+    if (!session) return;
+    this.freeze(session);
+    logInfo(
+      `связь с ${session.name} потеряна, место держим ${Math.round(this.resumeGraceMs / 1000)} с`,
+      { players: this.sessions.size },
+    );
+  }
+
+  override onLeave(client: Client): void {
     this.pending.delete(client.sessionId);
     const session = this.sessions.get(client.sessionId);
     if (!session) return;
-    this.sessions.delete(client.sessionId);
+    // После onDrop Colyseus вызывает и onLeave — но место уже в резерве,
+    // отдавать его рано.
+    if (session.disconnectedAt !== null) return;
+    // Место могло быть забрано новым соединением по токену (F5, сон).
+    // Старый сокет закрывается — не удалять сессию, которая теперь у нового клиента.
+    if (session.client !== client) return;
+    this.dropSession(session);
+  }
+
+  /** Замораживает сессию и кладёт её место в резерв. */
+  private freeze(session: Session): void {
+    if (session.disconnectedAt !== null) return;
+    session.disconnectedAt = Date.now();
+    session.input = null;
+    session.vx = 0;
+    session.vz = 0;
+    session.moving = false;
+    session.sprinting = false;
+    // Иначе аватар «бежит» стоя: флаги движения — часть снимка.
+    const entity = this.entities.get(session.entityId);
+    if (entity) entity.flags = 0;
+  }
+
+  /** Отдаёт место окончательно: сущность, ник и токен. */
+  private dropSession(session: Session): void {
+    this.sessions.delete(session.sessionId);
     this.entities.delete(session.entityId);
+    this.resumeTokens.delete(session.resumeToken);
     this.genesisInFlight.delete(session.accountId);
     this.broadcastRoster();
     logInfo(`игрок ${session.name} вышел`, { players: this.sessions.size });
+  }
+
+  /**
+   * Возврат на прежнее место. Возвращает true, если игрок вернулся.
+   *
+   * Два пути:
+   *  1. токен из прошлого `welcome` — точный адрес места. Он работает даже
+   *     если сервер ещё не заметил, что старый сокет мёртв: место забирается
+   *     у старого соединения (сон/пробуждение ноутбука, гонка при F5).
+   *  2. тот же аккаунт и тот же ник — человек закрыл вкладку и открыл
+   *     заново, токен потерялся вместе с sessionStorage. Работает только
+   *     для простаивающего места. Пока авторизации нет (D-009), accountId —
+   *     единственное, что у нас есть; поэтому чужой человек с тем же
+   *     accountId тоже займёт место. Это цена v0.
+   *
+   * Захват места не превращается в перетягивание: токен при возврате
+   * ротируется, поэтому у выбитого соединения остаётся просроченный токен,
+   * и его следующая попытка получит новое место, а не отберёт это обратно.
+   */
+  private resume(client: Client, hello: HelloMsg): boolean {
+    const session = this.findResumable(hello);
+    if (!session) return false;
+    const previous = session.welcome;
+    if (!previous) return false;
+
+    if (session.disconnectedAt === null) {
+      // Место занято живым соединением. Токен однозначно указывает на него,
+      // а аккаунт совпал — это мы же. Старый сокет закрываем.
+      logInfo(`место ${session.name} забирает новое соединение`, {
+        players: this.sessions.size,
+      });
+      try {
+        session.client.leave(4003, 'место занято новым соединением');
+      } catch {
+        // Сокет уже мёртв — ровно то, что нам нужно.
+      }
+    }
+
+    this.resumeTokens.delete(session.resumeToken);
+    // Старый ключ — прежний сокет; новый клиент приходит со своим sessionId.
+    this.sessions.delete(session.sessionId);
+
+    session.client = client;
+    session.sessionId = client.sessionId;
+    session.disconnectedAt = null;
+    session.input = null;
+    session.vx = 0;
+    session.vz = 0;
+    // У нового клиента нет истории снимков: диффы ему не с чем сравнивать.
+    session.sent.clear();
+    session.resumeToken = randomUUID();
+    this.resumeTokens.set(session.resumeToken, session);
+    this.sessions.set(session.sessionId, session);
+
+    const welcome: WelcomeMsg = {
+      ...previous,
+      sessionId: session.sessionId,
+      // Клиент ставит предсказание ровно туда, где игрок пропал.
+      spawn: { x: session.x, y: session.y, z: session.z },
+      balance: session.balance,
+      resumeToken: session.resumeToken,
+      resumed: true,
+    };
+    session.welcome = welcome;
+
+    client.send(S2C.Welcome, welcome);
+    this.broadcastRoster();
+    this.sendSnapshot(session);
+    logInfo(`игрок ${session.name} вернулся на место`, { players: this.sessions.size });
+    return true;
+  }
+
+  /**
+   * Ищет место: сначала по токену (живое или простаивающее), потом по
+   * аккаунту и нику — но по второму пути только простаивающее.
+   */
+  private findResumable(hello: HelloMsg): Session | undefined {
+    if (hello.resume) {
+      const byToken = this.resumeTokens.get(hello.resume);
+      if (byToken) {
+        if (byToken.accountId !== hello.accountId) {
+          logWarn('токен возобновления от другого аккаунта', {
+            token: hello.resume.slice(0, 8),
+          });
+          return undefined;
+        }
+        return byToken;
+      }
+    }
+
+    const requested = sanitizeName(hello.name).toLowerCase();
+    for (const session of this.sessions.values()) {
+      if (session.disconnectedAt === null) continue;
+      if (session.accountId !== hello.accountId) continue;
+      if (session.name.toLowerCase() !== requested) continue;
+      return session;
+    }
+    return undefined;
   }
 
   override onDispose(): void {
@@ -498,7 +695,14 @@ export class SectorRoom extends Room {
     this.tick += 1;
 
     const now = Date.now();
+    const expired: Session[] = [];
     for (const session of this.sessions.values()) {
+      // Игрок отвалился: тело стоит, ввод не читаем, порталы не проверяем.
+      if (session.disconnectedAt !== null) {
+        if (now - session.disconnectedAt > this.resumeGraceMs) expired.push(session);
+        continue;
+      }
+
       let input = session.input;
 
       // Клиент замолчал (обрыв, вкладка в фоне) — не тащим его вперёд
@@ -526,9 +730,17 @@ export class SectorRoom extends Room {
 
       // Коллизии с пропами + край зоны (с радиусом). Та же формула, что
       // на клиенте в LocalPlayer — иначе предсказание резинит.
-      this.resolveMotion(session, session.x - prevX, session.z - prevZ);
+      this.resolveMotion(session, session.x - prevX, session.z - prevZ, crouch);
 
-      const vertical = stepVertical(session.y, session.vy, wantJump, crouch, dt);
+      // Высота опоры под ногами (F1-19): над пропом опора — его верх,
+      // около пропа — пол зоны. Ровно этот вызов есть и в LocalPlayer:
+      // разойдётся хотя бы на ступеньку — предсказание зажует резину.
+      const colliders = this.collidersFor(session);
+      const groundY = colliders
+        ? supportHeightAt(session.x, session.z, colliders, session.y)
+        : GROUND_Y;
+
+      const vertical = stepVertical(session.y, session.vy, wantJump, crouch, dt, groundY);
       session.y = vertical.y;
       session.vy = vertical.vy;
       session.airborne = !vertical.grounded;
@@ -555,9 +767,28 @@ export class SectorRoom extends Room {
           (session.airborne ? ENTITY_FLAG.Airborne : 0);
       }
     }
+    for (const session of expired) {
+      logInfo(`место ${session.name} освобождено: игрок не вернулся`, {});
+      this.dropSession(session);
+    }
+
+    this.disposeIfIdle(now);
+
     const dtMs = performance.now() - t0;
     this.tickDurations.push(dtMs);
     if (this.tickDurations.length > this.maxTickDurations) this.tickDurations.shift();
+  }
+
+  /** Пустая комната закрывается сама — иначе `autoDispose = false` течёт. */
+  private disposeIfIdle(now: number): void {
+    if (this.sessions.size > 0 || this.pending.size > 0 || this.clients.length > 0) {
+      this.idleSince = null;
+      return;
+    }
+    this.idleSince ??= now;
+    if (now - this.idleSince < ROOM_IDLE_MS) return;
+    logInfo('сектор пуст, закрываю', {});
+    void this.disconnect();
   }
 
   /** Метрики для F0-10/F0-11. */
@@ -617,8 +848,16 @@ export class SectorRoom extends Room {
   /**
    * Разрешает шаг против пропов текущей зоны и прижимает к bounds.
    * Обновляет zoneId по фактической точке (как старый clampToZone).
+   *
+   * `crouch` нужен для высоты тела: в приседе можно пройти под низким
+   * проёмом (F1-19).
    */
-  private resolveMotion(session: Session, dx: number, dz: number): void {
+  private resolveMotion(
+    session: Session,
+    dx: number,
+    dz: number,
+    crouch: boolean,
+  ): void {
     const zone = zoneAt(this.world, session.x, session.z) ?? (session.zoneId
       ? findZone(this.world, session.zoneId)
       : undefined);
@@ -628,7 +867,10 @@ export class SectorRoom extends Room {
     if (zone) {
       const colliders = this.zoneColliders.get(zone.id);
       if (colliders) {
-        const resolved = resolvePlayerMove(startX, startZ, dx, dz, colliders, PLAYER_RADIUS);
+        const resolved = resolvePlayerMove(startX, startZ, dx, dz, colliders, {
+          feetY: session.y,
+          height: crouch ? PLAYER_CROUCH_HEIGHT : PLAYER_HEIGHT,
+        });
         session.x = resolved.x;
         session.z = resolved.z;
         if (resolved.blockedX) session.vx = 0;
@@ -644,6 +886,19 @@ export class SectorRoom extends Room {
 
     const at = zoneAt(this.world, session.x, session.z);
     if (at) session.zoneId = at.id;
+  }
+
+  /**
+   * Коллизеры зоны, в которой игрок стоит сейчас (F1-19).
+   * Выбор зоны тот же, что в resolveMotion: по фактической точке, иначе
+   * последняя известная — иначе горизонталь и опора считались бы по разным
+   * зонам ровно на границе.
+   */
+  private collidersFor(session: Session): ZoneColliders | null {
+    const zone = zoneAt(this.world, session.x, session.z) ?? (session.zoneId
+      ? findZone(this.world, session.zoneId)
+      : undefined);
+    return zone ? (this.zoneColliders.get(zone.id) ?? null) : null;
   }
 
   /** Портал переносит игрока в соседнюю зону. Решение принимает сервер. */
@@ -763,6 +1018,8 @@ export class SectorRoom extends Room {
 
   private publish(): void {
     for (const session of this.sessions.values()) {
+      // Мёртвому сокету не шлём: клиент вернётся и получит полный снимок.
+      if (session.disconnectedAt !== null) continue;
       const visible = this.visibleEntities(session);
       const changed: EntityState[] = [];
       const removed: number[] = [];
