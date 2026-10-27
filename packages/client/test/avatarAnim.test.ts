@@ -18,14 +18,22 @@ describe('F1-4: анимация аватара', () => {
       legR: { rotation: { x: number } };
     };
 
+    // Фаза шага у каждого аватара своя (`Math.random()` в createAvatar),
+    // а ноги — это ±sin(фазы): в последнем кадре синус может попасть в ноль,
+    // и тест падал в ~3% прогонов (CI, 27.10: упал на docs-only PR).
+    // Поэтому меряем максимум за цикл, а не значение в одном кадре:
+    // за 20 кадров фаза проходит 2.2 рад — гарантированно мимо нуля.
+    let maxSwing = 0;
     for (let i = 0; i < 20; i += 1) {
       animateAvatar(avatar, 5, 16);
+      maxSwing = Math.max(
+        maxSwing,
+        Math.abs(parts.legL.rotation.x),
+        Math.abs(parts.legR.rotation.x),
+      );
     }
 
-    assert.ok(
-      Math.abs(parts.legL.rotation.x) > 0.05 || Math.abs(parts.legR.rotation.x) > 0.05,
-      'ноги должны качаться при ходьбе',
-    );
+    assert.ok(maxSwing > 0.05, 'ноги должны качаться при ходьбе');
     // Без bob/lean рига: иначе с камеры 3-го лица трясётся весь мир.
     assert.equal(parts.rig.position.y, 0);
     assert.equal(parts.rig.rotation.x, 0);
