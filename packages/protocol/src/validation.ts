@@ -13,6 +13,9 @@ export const helloSchema = z.object({
   accountCreatedAt: z.number().int().nonnegative(),
   // trim здесь, потому что имя уходит в ростер и в подпись над головой.
   name: z.string().trim().min(1).max(24),
+  // Токен возобновления. Мягко: битый токен — это «вход заново», а не
+  // дисконнект (Colyseus рвёт соединение при провале схемы).
+  resume: z.string().min(8).max(128).optional(),
 });
 
 /**

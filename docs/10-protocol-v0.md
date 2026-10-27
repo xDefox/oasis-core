@@ -160,7 +160,7 @@ WebSocket (Colyseus 0.18, `@colyseus/ws-transport`). Matchmaking — HTTP
 
 | Имя | Payload | Валидация |
 |---|---|---|
-| `hello` | `{ protocolVersion }` | zod, строка 1..32 |
+| `hello` | `{ protocolVersion, accountId, accountCreatedAt, name, resume? }` | zod `helloSchema`; `resume` — опциональный токен возобновления (F0-8) |
 | `input` | `{ seq, dirX, dirZ, yaw, sprint }` | zod, `dirX/dirZ` ∈ [−1,1] |
 | `chat` | `{ text }` | zod, 1..240 символов, rate limit |
 | `zone_request` | `{ zoneId }` | zod, строка 1..64 |
@@ -185,9 +185,11 @@ WebSocket (Colyseus 0.18, `@colyseus/ws-transport`). Matchmaking — HTTP
 
 ```ts
 {
-  protocolVersion: '0.2.0',
+  protocolVersion: '0.5.0',
   playerId: 7,              // id сущности, не sessionId
   sessionId: 'abc123',
+  resumeToken: '…',         // токен места (F0-8), клиент держит его в sessionStorage
+  resumed: false,           // true — вернулись на прежнее место, а не вошли заново
   world: {                  // заголовок без геометрии
     id: 'default', version: 1, seed: 20261021,
     generator: 'oasis-procgen/1',
@@ -197,13 +199,30 @@ WebSocket (Colyseus 0.18, `@colyseus/ws-transport`). Matchmaking — HTTP
   },
   sectorId: 's_plaza',
   tickRate: 20, snapshotRate: 10, aoiRadius: 24,
-  spawn: { x, y, z },
+  spawn: { x, y, z },       // при resumed=true — точка, где игрок пропал
   balance: 100
 }
 ```
 
 `world.zones` — **без** `props`. Геометрия приходит по `zone_request`.
 Это ключевое решение: заголовок мира — единицы килобайт, полный мир — сотни.
+
+### Возобновление сессии (F0-8)
+
+Обрыв (F5, спящий ноутбук, пропавший Wi-Fi) не должен выкидывать на спавн:
+
+1. Сервер ловит обрыв в `onDrop`: сессия **замораживается** (тело стоит, ввод
+   не читается, рассылка снимков приостановлена), место держится
+   `resumeGraceMs = 30 с`.
+2. Клиент сам повторяет подключение с паузами `0.5 / 1.5 / 4 с` и шлёт
+   `hello` с `resume` из прошлого `welcome`.
+3. Сервер находит место по токену (или по `accountId` + ник, если место уже
+   простаивает — цена v0 до F0-6), **ротирует токен** и отвечает
+   `welcome { resumed: true, spawn: место_пропала }`.
+4. Если место занял живой сокет — старое соединение закрывается кодом
+   `4003`, клиент переподключаться после него не обязан.
+5. Не вернулся за 30 с — место отдаётся. Пустая комната живёт ещё
+   `ROOM_IDLE_MS = 10 с` (`autoDispose = false`), потом закрывается сама.
 
 Коды ошибок:
 

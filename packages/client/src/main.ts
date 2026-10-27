@@ -64,6 +64,12 @@ const CAMERA_TARGET_HEIGHT = 1.55;
 
 const ACCOUNT_KEY = 'oasis.account';
 const NAME_KEY = 'oasis.name';
+/**
+ * Токен места — в sessionStorage, а не в localStorage: он принадлежит
+ * ВКЛАДКЕ. Соседняя вкладка того же браузера — отдельный игрок, а не тот же
+ * самый; общий ключ заставил бы их отбирать друг у друга одно тело.
+ */
+const RESUME_KEY = 'oasis.resume';
 
 interface Account {
   id: string;
@@ -120,6 +126,15 @@ function loadName(): string {
  */
 function saveName(name: string): void {
   window.localStorage.setItem(NAME_KEY, name);
+}
+
+/** Токен возобновления текущей вкладки: переживает F5, умирает с вкладкой. */
+function loadResumeToken(): string | undefined {
+  return window.sessionStorage.getItem(RESUME_KEY) ?? undefined;
+}
+
+function saveResumeToken(token: string): void {
+  window.sessionStorage.setItem(RESUME_KEY, token);
 }
 
 async function main(): Promise<void> {
@@ -278,20 +293,31 @@ async function main(): Promise<void> {
 
   const handlers = {
     onWelcome(message: WelcomeMsg): void {
-      hud.addChatLine(null, `добро пожаловать, ${message.world.id}@${message.world.version}`);
+      saveResumeToken(message.resumeToken);
+      // Возврат после обрыва: старые сэмплы описывают прошлую сессию, и
+      // интерполяция потянула бы тело из точки «до» в точку «после».
+      if (message.resumed) {
+        state.reset();
+        lastReconciledTick = -1;
+        hud.addChatLine(null, `связь восстановлена: ты снова ${message.name}`);
+      } else {
+        hud.addChatLine(null, `добро пожаловать, ${message.world.id}@${message.world.version}`);
+      }
       // Ник мог измениться: сервер разводит совпадения суффиксом. Молчать
       // об этом нельзя — игрок будет искать, почему его зовут иначе.
       selfName = message.name;
       const requestedName = loadName();
-      if (message.name !== requestedName) {
-        hud.addChatLine(null, `ник «${requestedName}» уже занят здесь — ты ${message.name}`);
-      } else {
-        hud.addChatLine(null, `ты в мире как «${message.name}»`);
+      if (!message.resumed) {
+        if (message.name !== requestedName) {
+          hud.addChatLine(null, `ник «${requestedName}» уже занят здесь — ты ${message.name}`);
+        } else {
+          hud.addChatLine(null, `ты в мире как «${message.name}»`);
+        }
+        hud.addChatLine(
+          null,
+          'WASD — идти, Shift — бежать, Ctrl — присесть, Space — прыжок, мышь — камера, Enter — чат',
+        );
       }
-      hud.addChatLine(
-        null,
-        'WASD — идти, Shift — бежать, Ctrl — присесть, Space — прыжок, мышь — камера, Enter — чат',
-      );
       state.localPlayerId = message.playerId;
       zoneSummaries = message.world.zones;
       worldPortals = message.world.portals ?? [];
@@ -410,6 +436,8 @@ async function main(): Promise<void> {
     onStatus(status: 'connecting' | 'open' | 'closed' | 'error', detail?: string): void {
       hud.setStatus(status, detail);
       if (status === 'open') hud.addChatLine(null, 'соединение установлено');
+      // 'closed' приходит только на явный выход: после обрыва клиент
+      // переподключается и пишет 'connecting', а не «соединение закрыто».
       if (status === 'closed') {
         hud.addChatLine(null, 'соединение закрыто');
         remoteView.clear();
@@ -433,6 +461,7 @@ async function main(): Promise<void> {
         accountId: account.id,
         accountCreatedAt: account.createdAt,
         name: joinName,
+        resume: loadResumeToken(),
       },
       handlers,
     );
@@ -660,9 +689,12 @@ async function main(): Promise<void> {
     }
   }
 
-  window.addEventListener('beforeunload', () => {
-    connection.leave();
-  });
+  // На выгрузке страницы ничего не шлём: явный leave() со стороны клиента —
+  // это «ушёл по своему желанию», и сервер отдаёт место сразу (F0-8 не
+  // срабатывает). Сокет закрывается сам, сервер видит обрыв в onDrop и
+  // держит место 30 с — ровно то, что нужно при F5 и пропавшем Wi-Fi.
+  // Явный выход остаётся в Connection.leave() — его зовут оттуда, где
+  // выход осознанный.
 
   // Отладочный доступ для зонда (scripts/probe-client.mjs). Не API:
   // существует только чтобы можно было проверить предсказание снаружи.

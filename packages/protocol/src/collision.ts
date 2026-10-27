@@ -1,16 +1,28 @@
 /**
- * Коллизии игрока с пропами зоны (F1-1).
+ * Коллизии игрока с пропами зоны (F1-1, F1-19).
  *
  * Движение в OASIS v0 — горизонтальное (XZ). Один чистый резолвер обязаны
  * вызывать и сервер, и клиентское предсказание: иначе упор в столб на
  * сервере даёт резиновый бан на клиенте.
  *
- * Модель: круг радиуса PLAYER_RADIUS против OBB/круга пропа в XZ.
- * Пропы, которые по высоте не пересекают тело [0, PLAYER_HEIGHT], пропускаем
- * (кроны деревьев над головой не блокируют проход).
+ * Модель: круг радиуса PLAYER_RADIUS против OBB/круга пропа в XZ, плюс
+ * высота: у каждого коллайдера есть низ и верх. Вертикальный отбор живёт в
+ * момент решения, а не при сборке зоны (F1-19), поэтому одни и те же пропы
+ * разные для стоящего на земле, прыгающего и вошедшего на ступеньку:
+ *
+ *   - `blocksBody` — во что нельзя войти: проп выше, чем можно подняться
+ *     шагом, и ниже макушки тела. Крона над головой сюда не попадает;
+ *   - `supportsBody` — на чём можно стоять: верх пропа не выше шага вверх;
+ *   - `supportHeightAt` — высота опоры под ногами. Её отдаёт в
+ *     `stepVertical` вызывающий, чтобы подтянуть тело на ступеньку.
  */
 
-import { PLAYER_HEIGHT, PLAYER_RADIUS } from './constants.ts';
+import {
+  GROUND_Y,
+  PLAYER_HEIGHT,
+  PLAYER_RADIUS,
+  PLAYER_STEP_UP,
+} from './constants.ts';
 import type { PropDef, ZoneBounds, ZoneDef } from './types.ts';
 
 /** Размер ячейки сетки, м. */
@@ -32,6 +44,9 @@ export interface PropCollider {
   maxX: number;
   minZ: number;
   maxZ: number;
+  /** Низ и верх пропа по оси Y, м (F1-19). */
+  y0: number;
+  y1: number;
 }
 
 export interface ZoneColliders {
@@ -54,19 +69,43 @@ export interface MoveResult {
   blockedZ: boolean;
 }
 
-/** Есть ли пересечение вертикальных отрезков пропа и тела игрока. */
-export function propOverlapsPlayerHeight(prop: PropDef, height = PLAYER_HEIGHT): boolean {
-  const bottom = prop.y - prop.sy;
-  const top = prop.y + prop.sy;
-  return top > 0 && bottom < height;
+/**
+ * Препятствие: проп пересекает тело и выше, чем можно подняться шагом.
+ *
+ * Низкий бордюр с земли блокирует, в прыжке — проходится; крона над головой
+ * не блокирует, пока игрок ниже её низа, и блокирует, если забрался выше.
+ */
+export function blocksBody(
+  collider: PropCollider,
+  feetY = GROUND_Y,
+  height = PLAYER_HEIGHT,
+  stepUp = PLAYER_STEP_UP,
+): boolean {
+  return collider.y1 > feetY + stepUp && collider.y0 < feetY + height;
 }
 
 /**
- * Горизонтальный коллайдер пропа, или null если по высоте не пересекает тело.
+ * Опора: верх пропа не выше шага вверх — на него можно встать и по нему
+ * ходить. Выше — тело не подтягивается, нужен прыжок.
+ */
+export function supportsBody(
+  collider: PropCollider,
+  feetY = GROUND_Y,
+  stepUp = PLAYER_STEP_UP,
+): boolean {
+  return collider.y1 <= feetY + stepUp;
+}
+
+/**
+ * Горизонтальный коллайдер пропа — всегда, без отбраковки по высоте.
+ * Отбраковка перенесена в `blocksBody`: если выбросить проп на этапе
+ * сборки зоны, он неизвестен игроку с любой высотой ног — и крона в 3 м
+ * перестаёт быть препятствием даже для того, кто стоит на ней.
  * Габариты совпадают с визуалом в client/render/world.ts (sx/sz — полуразмеры).
  */
-export function propCollider(prop: PropDef): PropCollider | null {
-  if (!propOverlapsPlayerHeight(prop)) return null;
+export function propCollider(prop: PropDef): PropCollider {
+  const y0 = prop.y - prop.sy;
+  const y1 = prop.y + prop.sy;
 
   if (prop.type === 'box' || prop.type === 'pillar') {
     const cos = Math.cos(prop.rot);
@@ -84,6 +123,8 @@ export function propCollider(prop: PropDef): PropCollider | null {
       maxX: prop.x + extX,
       minZ: prop.z - extZ,
       maxZ: prop.z + extZ,
+      y0,
+      y1,
     };
   }
 
@@ -96,6 +137,8 @@ export function propCollider(prop: PropDef): PropCollider | null {
     maxX: prop.x + radius,
     minZ: prop.z - radius,
     maxZ: prop.z + radius,
+    y0,
+    y1,
   };
 }
 
@@ -103,8 +146,7 @@ export function propCollider(prop: PropDef): PropCollider | null {
 export function buildZoneColliders(zone: ZoneDef): ZoneColliders {
   const items: PropCollider[] = [];
   for (const prop of zone.props) {
-    const collider = propCollider(prop);
-    if (collider) items.push(collider);
+    items.push(propCollider(prop));
   }
 
   const halfW = zone.bounds.w / 2;
@@ -164,8 +206,28 @@ export function clampToBounds(
 }
 
 /**
+ * Как тело стоит в этот момент: радиус, высота ног и макушки.
+ * Раньше позиционно передавался только радиус (F1-1); с высотой (F1-19)
+ * набор вырос, и объект читается прямо на месте вызова.
+ */
+export interface MoveContext {
+  /** Радиус круга игрока, м. */
+  radius?: number;
+  /** Высота ног над опорой: от неё зависит, во что упираемся. */
+  feetY?: number;
+  /** Высота тела: полная или в приседе. */
+  height?: number;
+  /** На сколько можно подняться одним шагом, м. */
+  stepUp?: number;
+}
+
+/**
  * Сдвиг позиции с разрешением коллизий.
  * Раздельный sweep по X и Z — можно скользить вдоль стены.
+ *
+ * Препятствиями считаются только те пропы, что пересекают тело с учётом
+ * `context.feetY`: низкий бордюр блокирует с земли, в прыжке проходится,
+ * крона над головой не блокирует вовсе.
  */
 export function resolvePlayerMove(
   x: number,
@@ -173,21 +235,28 @@ export function resolvePlayerMove(
   dx: number,
   dz: number,
   colliders: ZoneColliders | null | undefined,
-  radius = PLAYER_RADIUS,
+  context: MoveContext = {},
 ): MoveResult {
+  const body: Required<MoveContext> = {
+    radius: context.radius ?? PLAYER_RADIUS,
+    feetY: context.feetY ?? GROUND_Y,
+    height: context.height ?? PLAYER_HEIGHT,
+    stepUp: context.stepUp ?? PLAYER_STEP_UP,
+  };
+  const radius = body.radius;
   let px = x;
   let pz = z;
   let blockedX = false;
   let blockedZ = false;
 
   // Сначала выталкиваем, если уже внутри (спавн / телепорт / коррекция).
-  const separated = separateFromProps(px, pz, colliders, radius);
+  const separated = separateFromProps(px, pz, colliders, body);
   px = separated.x;
   pz = separated.z;
 
   if (dx !== 0) {
     const nextX = px + dx;
-    if (collidesAt(nextX, pz, colliders, radius)) {
+    if (collidesAt(nextX, pz, colliders, body)) {
       blockedX = true;
     } else {
       px = nextX;
@@ -196,7 +265,7 @@ export function resolvePlayerMove(
 
   if (dz !== 0) {
     const nextZ = pz + dz;
-    if (collidesAt(px, nextZ, colliders, radius)) {
+    if (collidesAt(px, nextZ, colliders, body)) {
       blockedZ = true;
     } else {
       pz = nextZ;
@@ -214,11 +283,55 @@ export function resolvePlayerMove(
   return { x: px, z: pz, blockedX, blockedZ };
 }
 
+/**
+ * Высота опоры под ногами в точке (x, z) — F1-19.
+ *
+ * Максимум верхов пропов, на которые можно встать не выше шага вверх; если
+ * вокруг ничего — пол зоны. Точка проверяется по центру ноги, а не по
+ * радиусу: на бордюр можно забраться ровно в его границе, а «висеть» над
+ * краем в воздухе — нельзя.
+ *
+ * Контракт для `stepVertical`: результат никогда не выше `feetY + stepUp`,
+ * иначе тело телепортировало бы вверх.
+ */
+export function supportHeightAt(
+  x: number,
+  z: number,
+  colliders: ZoneColliders | null | undefined,
+  feetY = GROUND_Y,
+  stepUp = PLAYER_STEP_UP,
+): number {
+  if (!colliders) return GROUND_Y;
+
+  let best = GROUND_Y;
+  for (const collider of queryNearby(x, z, colliders, PLAYER_RADIUS)) {
+    if (!supportsBody(collider, feetY, stepUp)) continue;
+    if (collider.y1 <= best) continue;
+    if (!containsPoint(x, z, collider)) continue;
+    best = collider.y1;
+  }
+  return best;
+}
+
+/** Центр ноги внутри горизонтального габарита пропа. */
+function containsPoint(x: number, z: number, collider: PropCollider): boolean {
+  if (collider.shape.kind === 'circle') {
+    return Math.hypot(x - collider.x, z - collider.z) <= collider.shape.radius;
+  }
+
+  const { hx, hz, cos, sin } = collider.shape;
+  const wx = x - collider.x;
+  const wz = z - collider.z;
+  const lx = cos * wx + sin * wz;
+  const lz = -sin * wx + cos * wz;
+  return Math.abs(lx) <= hx && Math.abs(lz) <= hz;
+}
+
 function separateFromProps(
   x: number,
   z: number,
   colliders: ZoneColliders | null | undefined,
-  radius: number,
+  body: Required<MoveContext>,
 ): { x: number; z: number } {
   if (!colliders || colliders.items.length === 0) return { x, z };
 
@@ -226,8 +339,12 @@ function separateFromProps(
   let pz = z;
   for (let iter = 0; iter < SEPARATE_ITERS; iter += 1) {
     let moved = false;
-    for (const collider of queryNearby(px, pz, colliders, radius)) {
-      const push = penetration(px, pz, collider, radius);
+    for (const collider of queryNearby(px, pz, colliders, body.radius)) {
+      // Проп, в который тело уже не упирается (стоим сверху, крона над
+      // головой), не выталкивает — иначе игрока выкидывало бы с собственной
+      // ступеньки.
+      if (!blocksBody(collider, body.feetY, body.height, body.stepUp)) continue;
+      const push = penetration(px, pz, collider, body.radius);
       if (!push) continue;
       px += push.x;
       pz += push.z;
@@ -242,11 +359,12 @@ function collidesAt(
   x: number,
   z: number,
   colliders: ZoneColliders | null | undefined,
-  radius: number,
+  body: Required<MoveContext>,
 ): boolean {
   if (!colliders) return false;
-  for (const collider of queryNearby(x, z, colliders, radius)) {
-    if (overlaps(x, z, collider, radius)) return true;
+  for (const collider of queryNearby(x, z, colliders, body.radius)) {
+    if (!blocksBody(collider, body.feetY, body.height, body.stepUp)) continue;
+    if (overlaps(x, z, collider, body.radius)) return true;
   }
   return false;
 }

@@ -167,3 +167,49 @@ describe('движение: разгон, торможение, ограниче
     assert.equal(crouched.y, GROUND_Y);
   });
 });
+
+/**
+ * F1-19: опора перестала быть плоскостью y=0. Механика живёт в общей
+ * `stepVertical`, поэтому здесь же проверяется, что сервер и клиент
+ * поднимутся на ступеньку одним и тем же числом.
+ */
+describe('F1-19: опора и шаг вверх', () => {
+  it('приземляется на опору выше пола, а не сквозь неё', () => {
+    const ledge = 0.5;
+    let y = 1.4;
+    let vy = -1;
+    let grounded = false;
+    for (let i = 0; i < TICK_RATE; i += 1) {
+      const next = stepVertical(y, vy, false, false, DT, ledge);
+      y = next.y;
+      vy = next.vy;
+      grounded = next.grounded;
+    }
+    assert.equal(y, ledge, 'остановился ровно на верху пропа');
+    assert.equal(grounded, true);
+    assert.equal(vy, 0);
+  });
+
+  it('шаг вверх подтягивает тело к опоре без прыжка', () => {
+    const next = stepVertical(0, 0, false, false, DT, 0.3);
+    assert.equal(next.y, 0.3, 'бордюр 0.3 м взят ногой');
+    assert.equal(next.grounded, true);
+    assert.equal(next.jumped, false, 'это не прыжок и не падение');
+  });
+
+  it('прыжок стартует с высоты опоры, а не с пола', () => {
+    const start = stepVertical(0.5, 0, true, false, DT, 0.5);
+    assert.equal(start.jumped, true);
+    assert.ok(start.y > 0.5, `тело ушло вверх: ${start.y}`);
+    assert.equal(start.grounded, false);
+  });
+
+  it('опора выше шага вверх телепортом вверх не берётся', () => {
+    // Вне контракта supportHeightAt (в игре такого не бывает): даже так
+    // тело не должно въехать на столб одним касанием — иначе «застревание»
+    // превратилось бы в бесплатный лифт.
+    const next = stepVertical(0, 0, false, false, DT, 1.2);
+    assert.ok(next.y <= 0, `подъём без прыжка запрещён, получили ${next.y}`);
+    assert.equal(next.grounded, false, 'на недосягаемую опору не «встал»');
+  });
+});
