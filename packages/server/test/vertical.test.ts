@@ -353,6 +353,9 @@ describe('вертикальный срез: два игрока видят др
     );
 
     // Бета двигается: альфа должна увидеть это в дельтах.
+    // Сдвиг меряем от её спавна, а не от нуля: координата spawn в world.json
+    // — дизайн уровня, а не свойство дельт (после F1-6 спавн уедет снова).
+    const betaSpawnX = betaWelcome.spawn.x;
     betaRoom.sendBytes(
       BIN_CHANNEL,
       encodeInput({ seq: 1, dirX: 1, dirZ: 0, yaw: 0, sprint: true }),
@@ -362,14 +365,17 @@ describe('вертикальный срез: два игрока видят др
       () => {
         for (const delta of alphaRecord.deltas) {
           const betaState = delta.changed.find((entity) => entity.id === betaWelcome.playerId);
-          if (betaState && betaState.x > 1) return betaState;
+          if (betaState && betaState.x > betaSpawnX + 1) return betaState;
         }
         return undefined;
       },
       8000,
       'движение беты в дельтах альфы',
     );
-    assert.ok(moved.x > 1, `бета должна сместиться по X, получено x=${moved.x}`);
+    assert.ok(
+      moved.x > betaSpawnX + 1,
+      `бета должна сместиться по X от спавна ${betaSpawnX}, получено x=${moved.x}`,
+    );
 
     // Собственная сущность альфы в снимке тоже есть.
     const alphaSnapshot = await waitFor(() => alphaRecord.snapshots[0], 8000, 'снимок альфы');
@@ -545,23 +551,35 @@ describe('вертикальный срез: два игрока видят др
     });
     await waitFor(() => record.welcome, 8000, 'welcome');
 
-    // Один-единственный ввод — дальше клиент молчит.
-    room.sendBytes(BIN_CHANNEL, encodeInput({ seq: 1, dirX: 1, dirZ: 0, yaw: 0, sprint: true }));
+    // Один-единственный ввод — дальше клиент молчит. Едем на запад: там от
+    // спавна до стены z_plaza больше 20 м свободы, а на восток через несколько
+    // метров стоят лавки. Проп важен: без него игрок врезался бы раньше, чем
+    // истечёт TTL, и тест не увидел бы разницы (мутация выжила бы).
+    room.sendBytes(BIN_CHANNEL, encodeInput({ seq: 1, dirX: -1, dirZ: 0, yaw: 0, sprint: true }));
 
-    // Ждём заметно дольше TTL ввода (1 с).
-    await new Promise((resolve) => setTimeout(resolve, 2500));
+    const lastOwnX = (): number | undefined =>
+      record.deltas
+        .flatMap((delta) => delta.changed)
+        .filter((entity) => entity.id === record.welcome?.playerId)
+        .at(-1)?.x;
 
-    const own = record.deltas
-      .flatMap((delta) => delta.changed)
-      .filter((entity) => entity.id === record.welcome?.playerId)
-      .at(-1);
-    assert.ok(own, 'сервер не прислал состояние игрока');
-
-    // Без TTL игрок доехал бы до стены z_plaza (x = 32). С TTL он должен
-    // замереть там, где остановился.
+    // Ждём дольше TTL ввода (1 с): игрок обязан был уже замереть.
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    const settled = lastOwnX();
+    assert.ok(settled !== undefined, 'сервер не прислал состояние игрока');
+    const spawnX = record.welcome?.spawn.x ?? 0;
     assert.ok(
-      own.x < 12,
-      `игрок с мёртвым вводом продолжает ехать: x=${own.x} (ждали остановки)`,
+      settled < spawnX - 1,
+      `игрок не поехал с одного ввода: x=${settled} (спавн ${spawnX}) — нечего останавливать`,
+    );
+
+    // Ещё 2 с молчания клиента. С TTL позиция не меняется; без TTL игрок
+    // продолжал бы ехать к западной стене.
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+    const after = lastOwnX();
+    assert.ok(
+      after !== undefined && Math.abs(after - settled) < 0.5,
+      `игрок с мёртвым вводом продолжает ехать: x=${settled} → ${after} (ждали остановки)`,
     );
 
     await room.leave();

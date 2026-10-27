@@ -9,22 +9,27 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
 import {
+  GROUND_Y,
   PLAYER_ACCEL,
+  PLAYER_CROUCH_SPEED,
+  PLAYER_GRAVITY,
+  PLAYER_JUMP_SPEED,
   PLAYER_SPEED,
   PLAYER_SPRINT_SPEED,
   TICK_RATE,
   speedOf,
   stepVelocity,
+  stepVertical,
 } from '@oasis/protocol';
 
 const DT = 1 / TICK_RATE;
 
 /** Прогон с постоянным вводом: возвращает скорость после n тиков. */
-function run(dirX: number, dirZ: number, sprint: boolean, ticks: number) {
+function run(dirX: number, dirZ: number, sprint: boolean, ticks: number, crouch = false) {
   let vx = 0;
   let vz = 0;
   for (let i = 0; i < ticks; i += 1) {
-    const next = stepVelocity(vx, vz, dirX, dirZ, sprint, DT);
+    const next = stepVelocity(vx, vz, dirX, dirZ, sprint, DT, crouch);
     vx = next.vx;
     vz = next.vz;
   }
@@ -49,6 +54,18 @@ describe('движение: разгон, торможение, ограниче
     const sprint = run(1, 0, true, TICK_RATE * 3);
     assert.ok(speedOf(sprint.vx, sprint.vz) > speedOf(walk.vx, walk.vz));
     assert.ok(speedOf(sprint.vx, sprint.vz) <= PLAYER_SPRINT_SPEED + 1e-6);
+  });
+
+  it('присед медленнее шага; спринт в приседе не помогает', () => {
+    const walk = run(1, 0, false, TICK_RATE * 3);
+    const crouch = run(1, 0, false, TICK_RATE * 3, true);
+    const crouchSprint = run(1, 0, true, TICK_RATE * 3, true);
+    assert.ok(speedOf(crouch.vx, crouch.vz) < speedOf(walk.vx, walk.vz));
+    assert.ok(Math.abs(speedOf(crouch.vx, crouch.vz) - PLAYER_CROUCH_SPEED) < 0.05);
+    assert.ok(
+      Math.abs(speedOf(crouchSprint.vx, crouchSprint.vz) - PLAYER_CROUCH_SPEED) < 0.05,
+      'присед отменяет спринт',
+    );
   });
 
   it('диагональ не быстрее прямой', () => {
@@ -120,5 +137,33 @@ describe('движение: разгон, торможение, ограниче
     const idle = run(0.004, 0.004, false, 10);
     assert.equal(idle.vx, 0);
     assert.equal(idle.vz, 0);
+  });
+
+  it('прыжок поднимает и возвращает на землю; в приседе нельзя', () => {
+    const start = stepVertical(GROUND_Y, 0, true, false, DT);
+    assert.equal(start.jumped, true);
+    // В том же тике уже вычитается g·dt — скорость чуть ниже импульса.
+    assert.ok(start.vy > PLAYER_JUMP_SPEED - PLAYER_GRAVITY * DT - 1e-6);
+    assert.equal(start.grounded, false);
+    assert.ok(start.y > GROUND_Y);
+
+    let y = start.y;
+    let vy = start.vy;
+    let maxY = y;
+    let grounded = false;
+    for (let i = 0; i < TICK_RATE * 3; i += 1) {
+      const next = stepVertical(y, vy, false, false, DT);
+      y = next.y;
+      vy = next.vy;
+      grounded = next.grounded;
+      if (y > maxY) maxY = y;
+    }
+    assert.ok(maxY > 0.8, `высота прыжка ${maxY}`);
+    assert.ok(grounded);
+    assert.equal(y, GROUND_Y);
+
+    const crouched = stepVertical(GROUND_Y, 0, true, true, DT);
+    assert.equal(crouched.jumped, false);
+    assert.equal(crouched.y, GROUND_Y);
   });
 });
