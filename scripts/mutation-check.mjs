@@ -231,6 +231,62 @@ const MUTATIONS = [
     expect: 'генератор собирает мир без ловушек',
   },
 
+  // ── F0-6/F0-7: авторизация-lite ────────────────────────────────────────
+  {
+    name: 'подпись не сверяется (любой хвост подходит)',
+    file: 'packages/server/src/auth/session.ts',
+    from: '    if (!timingSafeEqual(expected, got)) return null;',
+    to: '    if (false) return null;',
+    expect: 'подделка подписи',
+  },
+  {
+    name: 'короткий accountId принимается',
+    file: 'packages/server/src/auth/session.ts',
+    from: "    if (typeof parsed.accountId !== 'string' || parsed.accountId.length < 8) return null;",
+    to: "    if (typeof parsed.accountId !== 'string') return null;",
+    expect: 'короткий accountId',
+  },
+  {
+    name: 'кука выдаётся без HttpOnly',
+    file: 'packages/server/src/auth/session.ts',
+    from: '  const cookie = `${COOKIE_NAME}=${signed}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}${secure}`;',
+    to: '  const cookie = `${COOKIE_NAME}=${signed}; Path=/; SameSite=Lax; Max-Age=${maxAge}${secure}`;',
+    expect: 'HttpOnly',
+  },
+  {
+    name: 'cookie не читается из HTTP-контекста colyseus',
+    file: 'packages/server/src/rooms/SectorRoom.ts',
+    from: '      (options as any)?.rawHeaders?.cookie ??\n      cookieFromContext(context);',
+    to: '      (options as any)?.rawHeaders?.cookie;',
+    expect: 'AuthContext',
+  },
+  {
+    name: 'accountCreatedAt снова берётся из hello (D-009 открыт)',
+    file: 'packages/server/src/rooms/SectorRoom.ts',
+    from: "    const accountCreatedAt: number =\n      hasServerAuth && typeof auth.issuedAt === 'number' ? auth.issuedAt : hello.accountCreatedAt;",
+    to: '    const accountCreatedAt: number =\n      hello.accountCreatedAt;',
+    expect: 'D-009',
+  },
+  {
+    name: 'в production пропускают без cookie',
+    file: 'packages/server/src/rooms/SectorRoom.ts',
+    from: "    if (process.env.NODE_ENV === 'production') return false;",
+    to: '    if (false) return false;',
+    expect: 'production без cookie',
+  },
+  {
+    name: 'валидная сессия перевыпускается при повторном запросе',
+    file: 'packages/server/src/http/session.ts',
+    from: `  const existing = readSessionFromCookieHeader(getCookieHeader(req));
+  if (existing) {
+    // Сессия есть и валидна — просто возвращаем её, не перевыпускаем.
+    sendJson(res, 200, { accountId: existing.accountId, issuedAt: existing.issuedAt });
+    return true;
+  }
+`,
+    to: '',
+    expect: 'повторно не перевыпускается',
+  },
 ];
 
 async function runTests() {
