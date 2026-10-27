@@ -26,6 +26,8 @@ export const inputSchema = z.object({
   dirZ: z.number().finite(),
   yaw: z.number().finite(),
   sprint: z.boolean(),
+  crouch: z.boolean().optional().default(false),
+  jump: z.boolean().optional().default(false),
 });
 
 export const helloHandshakeSchema = z.object({

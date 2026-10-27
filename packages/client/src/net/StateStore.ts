@@ -17,6 +17,8 @@ import {
   type PlayerInfo,
 } from '@oasis/protocol';
 
+import { REMOTE_SNAP_M } from './RemotePresentation.ts';
+
 export const INTERP_DELAY_MS = 110;
 const MAX_SAMPLES = 10;
 
@@ -70,6 +72,13 @@ export class StateStore {
     if (last && last.t === now) {
       buffer[buffer.length - 1] = { t: now, state: entity };
       return;
+    }
+    // F1-3: телепорт / скачок дальше REMOTE_SNAP_M — не интерполируем сквозь мир.
+    if (last) {
+      const jump = Math.hypot(entity.x - last.state.x, entity.z - last.state.z);
+      if (jump >= REMOTE_SNAP_M) {
+        buffer.length = 0;
+      }
     }
     buffer.push({ t: now, state: entity });
     if (buffer.length > MAX_SAMPLES) buffer.shift();

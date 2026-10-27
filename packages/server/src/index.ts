@@ -19,7 +19,7 @@ import cors from 'cors';
 import express from 'express';
 
 import { config, logError, logInfo, REPO_ROOT } from './config.ts';
-import { SectorRoom } from './rooms/SectorRoom.ts';
+import { SectorRoom, sectorRooms } from './rooms/SectorRoom.ts';
 import { createStore } from './store/index.ts';
 import { loadWorld } from './world/loadWorld.ts';
 
@@ -97,6 +97,40 @@ async function main(): Promise<void> {
     ledger: store.ledger,
     maxPlayers: config.maxPlayersPerSector,
   });
+
+  // Тестовый хук: увести игрока в другую зону тем же путём, что портал.
+  //
+  // Зачем вообще HTTP, а не пеший маршрут в зонде: зонд проверяет поведение
+  // при выходе из зоны, а не планировку мира. Пеший путь был завязан на пропы
+  // конкретного world.json — и после F1-16 (мир под коллизии) чек падал бы
+  // на живом коде. Роут появляется только под OASIS_TEST_HOOKS=1: без флага
+  // маршрута нет вовсе, публичный сервер снаружи недоступен.
+  //
+  // Регистрируем здесь, а не рядом с /health: хуку нужна готовая комната.
+  if (config.testHooks) {
+    app.post('/debug/move', (request, response) => {
+      const name = typeof request.body?.name === 'string' ? request.body.name.trim() : '';
+      if (!name) {
+        response.status(400).json({ ok: false, error: 'нужно имя игрока' });
+        return;
+      }
+
+      const sector = sectorRooms()[0];
+      if (!sector) {
+        response.status(409).json({ ok: false, error: 'комната ещё не поднята' });
+        return;
+      }
+
+      const moved = sector.moveToOtherZone(name);
+      if (!moved) {
+        response.status(404).json({ ok: false, error: `игрок ${name} не найден` });
+        return;
+      }
+
+      logInfo('тестовый перенос игрока', { name, ...moved });
+      response.json({ ok: true, ...moved });
+    });
+  }
 
   await gameServer.listen(config.port, config.host);
 

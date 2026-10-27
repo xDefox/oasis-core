@@ -10,6 +10,36 @@
   <body>
     <canvas id="scene"></canvas>
 
+    <div id="onboarding" class="onboarding" hidden aria-hidden="true">
+      <div class="onboarding-card">
+        <p class="onboarding-brand">OASIS</p>
+        <h1 class="onboarding-title">добро пожаловать</h1>
+        <p class="onboarding-lead">
+          Маленький мир из примитивов. Увидь других, пробегись, напиши в чат.
+        </p>
+        <form id="onboarding-form" class="onboarding-form">
+          <label class="onboarding-label" for="onboarding-name">твой ник</label>
+          <input
+            id="onboarding-name"
+            class="onboarding-input"
+            type="text"
+            maxlength="24"
+            autocomplete="nickname"
+            spellcheck="false"
+          />
+          <ul class="onboarding-tips">
+            <li><kbd>WASD</kbd> — ходить</li>
+            <li><kbd>Shift</kbd> — бежать</li>
+            <li><kbd>Ctrl</kbd> — присесть</li>
+            <li><kbd>Space</kbd> — прыжок</li>
+            <li><kbd>мышь</kbd> — смотреть (клик по миру)</li>
+            <li><kbd>Enter</kbd> — чат · <kbd>/name</kbd> — сменить ник</li>
+          </ul>
+          <button type="submit" class="onboarding-go">войти в оазис</button>
+        </form>
+      </div>
+    </div>
+
     <div id="crosshair" class="crosshair" hidden></div>
 
     <div id="status" class="status">
@@ -40,8 +70,9 @@
     </div>
 
     <div id="hint" class="hint">
-      <b>WASD</b> — движение · <b>Shift</b> — бег · <b>мышь</b> — обзор (клик по сцене) ·
-      <b>Enter</b> — чат · <b>Tab</b> — освободить курсор
+      <b>WASD</b> — движение · <b>Shift</b> — бег · <b>Ctrl</b> — присед ·
+      <b>Space</b> — прыжок · <b>мышь</b> — обзор · <b>колёсико</b> — зум ·
+      <b>Enter</b> — чат · <b>Tab</b> — курсор
     </div>
 
     <script type="module" src="/src/main.ts"></script>

@@ -53,11 +53,19 @@ function shutdown() {
   }
 }
 
-function spawnChild(name, args, color) {
+function spawnChild(name, args, color, extraEnv = {}) {
   const child = spawn(npm, args, {
     cwd: root,
     stdio: ['ignore', 'pipe', 'pipe'],
-    env: { ...process.env, FORCE_COLOR: '1', OASIS_STORAGE: 'memory' },
+    env: {
+      ...process.env,
+      FORCE_COLOR: '1',
+      OASIS_STORAGE: 'memory',
+      // Зондам нужен тестовый перенос игрока между зонами (POST /debug/move):
+      // так переход между мирами проверяется без пешего маршрута по пропам.
+      OASIS_TEST_HOOKS: '1',
+      ...extraEnv,
+    },
     shell: false,
     detached: false,
   });
@@ -171,10 +179,20 @@ async function main() {
 
   log(`зондов к запуску: ${probes.length} — ${probes.join(', ')}`);
 
-  spawnChild('server', ['run', 'start'], '\x1b[36m');
+  spawnChild('server', ['run', 'start'], '\x1b[36m', {
+    // Сервер обязан слушать порт, который ждёт раннер. Без этого
+    // OASIS_SERVER_PORT меняет только health-URL, а процесс садится на
+    // дефолтный 2567: в CI они совпадают случайно, при любом оффсете
+    // прогон падает «fetch failed» — а зонды звали бы хук не на тот сервер.
+    PORT: String(SERVER_PORT),
+  });
   await waitFor('сервер', () => fetchOk(HEALTH_URL));
 
-  spawnChild('client', ['run', 'dev:client'], '\x1b[35m');
+  spawnChild('client', ['run', 'dev:client'], '\x1b[35m', {
+    // Клиент должен ходить на «наш» сервер, а не на дефолтный 2567: без
+    // этого при OASIS_SERVER_PORT ≠ 2567 зонды проверили бы чужой процесс.
+    VITE_SERVER_URL: `ws://localhost:${SERVER_PORT}`,
+  });
   await waitFor('клиент', () => fetchOk(CLIENT_URL, true));
 
   // Даём серверу секунду на полную инициализацию комнаты до первого зонда.
