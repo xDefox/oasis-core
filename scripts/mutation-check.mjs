@@ -187,6 +187,7 @@ const MUTATIONS = [
     to: '      const vertical = stepVertical(session.y, session.vy, wantJump, crouch, dt);',
     expect: 'сервер ставит игрока на ступеньку',
   },
+
   {
     name: 'щель между пропами не считается ловушкой',
     file: 'packages/server/src/world/worldCheck.ts',
@@ -229,6 +230,7 @@ const MUTATIONS = [
     to: '    return Math.hypot(dx, dz) >= options.clearRadius;',
     expect: 'генератор собирает мир без ловушек',
   },
+
 ];
 
 async function runTests() {
