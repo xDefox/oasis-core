@@ -1,7 +1,11 @@
-# Публичный доступ без VPS: Cloudflare quick tunnel
+# Публичный доступ без VPS: туннели (serveo → Cloudflare → pinggy)
 
 Задача F1-10: человек открывает сервер на своём ноуте, остальные заходят как на
 сайт — из любой сети, без проброса портов, домена и аккаунта Cloudflare.
+
+Задача F1-17: адрес не меняется при каждом запуске — им можно поделиться
+заранее. Так и есть: `deploy.sh` по умолчанию берёт **serveo** (`auto`),
+если зарегистрирован SSH-ключ (см. раздел «Постоянная ссылка»).
 
 ## Как это работает
 
@@ -9,11 +13,11 @@
 
 | Что | Локальный порт | Наружу |
 | --- | --- | --- |
-| игровой сервер (Colyseus) + собранный клиент | 2567 | `https://<random>.trycloudflare.com` |
+| игровой сервер (Colyseus) + собранный клиент | 2567 | `https://<имя>.serveousercontent.com` (serveo, постоянный) |
+| то же, если serveo недоступен | 2567 | `https://<random>.trycloudflare.com` или `https://<random>.free.pinggy.net` |
 
-Адрес выдаёт Cloudflare при старте (`trycloudflare.com`, без логина).
-Его нужно **вшить в сборку клиента** до `npm run build`, потому что адрес
-известен только после старта туннеля:
+Адрес выдаёт туннель при старте. Его нужно **вшить в сборку клиента** до
+`npm run build`, потому что адрес известен только после старта туннеля:
 
 ```bash
 echo "VITE_SERVER_URL=wss://<tunnel-host>" > packages/client/.env.production
@@ -68,6 +72,67 @@ done
 Рабочий IP задаётся переменной `CF_API_IP`, всё это завёрнуто в
 `scripts/tunnel.sh`.
 
+## Постоянная ссылка: serveo (F1-17)
+
+Бесплатные quick tunnel и pinggy дают **новый адрес при каждом запуске** —
+поделиться ссылкой заранее нельзя. serveo резервирует имя за SSH-ключом:
+адрес один и тот же от запуска к запуску.
+
+Регистрация ключа — один раз, вход через Google/GitHub:
+
+```bash
+ssh-keygen -t ed25519 -f ~/.ssh/serveo_key -N ''   # если ключа ещё нет
+ssh-keygen -lf ~/.ssh/serveo_key.pub                # fingerprint
+# открыть: https://console.serveo.net/ssh/keys?add=<fingerprint>
+```
+
+Дальше `deploy.sh` сам поднимает туннель с именем `$SERVEO_SUBDOMAIN`
+(по умолчанию `oasis-play`) и печатает:
+
+```
+игра:  https://oasis-play.serveousercontent.com
+serveo: адрес постоянный — имя «oasis-play» закреплено за ключом
+```
+
+Проверено 27.10: повторный запуск `TUNNEL=serveo scripts/deploy.sh` даёт
+**тот же адрес**, `deploy-check` → `rc=0` (два окна, ростер 2, видимые тела —
+то есть WebSocket по этому адресу проходит в реальном браузере).
+
+Что выяснилось на месте — чтобы не переделывать:
+
+- **Имя должно быть свободным.** Занятое (`oasis`, `oasis-core`) serveo
+  отклоняет через `remote port forwarding failed for listen port 80`.
+  Поэтому `deploy.sh` перед новым туннелем убивает старый ssh — иначе
+  второй запуск падает на собственном висящем подключении.
+- **Домен у постоянного и случайного адреса один** (`serveousercontent.com`),
+  поэтому «постоянность» определяется по имени: `<имя>.serveousercontent.com`
+  — постоянный, `<хеш>-<ip>.serveousercontent.com` — случайный (ключ не
+  зарегистрирован или имя заняли).
+- **Имя резервирует только зарегистрированный ключ**: чужой
+  незарегистрированный ключ получает инструкцию про регистрацию, а не адрес.
+- **Страница предупреждения** «Serveo Browser Warning» с кнопкой
+  «Continue to Site»: её жмёт `deploy-check` (распознаёт её вместе с
+  pinggy-шным «Enter site»). Без клика страница откроется, но игра не
+  подключится — ровно так проверка и падала до фикса.
+- `auto` берёт serveo **только если есть ключ** `~/.ssh/serveo_key`: ключа
+  нет — поведение прежнее (Cloudflare → pinggy). Принудительно:
+  `TUNNEL=serveo scripts/deploy.sh`, имя — `SERVEO_SUBDOMAIN=...`.
+- Сервер деплоя запускается через `setsid`: своя сессия, процесс не умирает
+  вместе с закрытой родительской командой.
+
+### Что проверялось и отвергнуто
+
+- **ngrok** (бесплатный статический домен у аккаунта) — агента не пускают с
+  этого IP: `ERR_NGROK_9040 — We do not allow agents to connect to ngrok from
+  your IP address (151.249.216.93)`.
+- **localtunnel (`loca.lt`)** — имя «по-первому праву» (чужой может занять),
+  а сеть нестабильна: один успех, затем `HTTP 408` и таймауты 40–60 с.
+- **Pinggy с постоянным поддоменом** — это Pinggy Pro, $3/мес.
+- **Cloudflare named tunnel** — требует домен (у нас «без VPS и домена») и
+  упирается в DNS-глюки cloudflared (см. выше).
+- **tunnelmole** — не пропускал `Upgrade: websocket`; **localhost.run**
+  требует ключ.
+
 ## Резерв: pinggy, если Cloudflare недоступен
 
 `api.trycloudflare.com` в какой-то момент может быть закрыт совсем (или
@@ -86,9 +151,8 @@ done
 Выбор принудительно: `TUNNEL=cloudflare scripts/deploy.sh` или
 `TUNNEL=pinggy scripts/deploy.sh`.
 
-Отдельно проверялось и отвергнуто: localtunnel (`loca.lt`) просит ввести
-свой публичный IP, serveo и tunnelmole не пропускают `Upgrade: websocket`
-(страница открывается, игра — нет), localhost.run требует ключ.
+Что проверялось и отвергнуто — см. раздел «Постоянная ссылка: serveo (F1-17)»
+выше (ngrok, localtunnel, Cloudflare named tunnel, tunnelmole).
 
 ## Проверка, что деплой действительно играется
 
@@ -117,8 +181,9 @@ scripts/deploy.sh
 Скрипт делает ровно эту последовательность и печатает ссылку:
 
 1. останавливает старые процессы на 2567/8080/5173, если висят;
-2. поднимает сервер и его туннель — ждёт появления `https://` в логе
-   (15 с на cloudflare, иначе pinggy);
+2. поднимает сервер (через `setsid`) и его туннель — ждёт появления `https://`
+   в логе: сначала serveo (20 с, если есть ключ), иначе cloudflare (15 с),
+   дальше pinggy (45 с);
 3. пишет `packages/client/.env.production` с этим адресом и собирает клиент
    (проверяет, что адрес реально попал в бандл);
 4. пишет состояние в `.deploy-state` и делает `curl` на страницу и на
@@ -135,21 +200,26 @@ scripts/deploy.sh
 
 ```bash
 node_modules/.bin/tsx packages/server/src/index.ts &   # :2567
-scripts/tunnel-pinggy.sh 2567 /tmp/pg.log              # или scripts/tunnel.sh
-grep -oE 'https://[a-z0-9-]+\.(free\.pinggy\.net|trycloudflare\.com)' /tmp/pg.log
+scripts/tunnel-serveo.sh 2567 /tmp/sv.log              # постоянный адрес
+# или scripts/tunnel-pinggy.sh 2567 /tmp/pg.log (случайный), либо scripts/tunnel.sh
+grep -oE 'https://[a-z0-9-]+\.(serveousercontent\.com|free\.pinggy\.net|trycloudflare\.com)' /tmp/sv.log
 
 echo "VITE_SERVER_URL=wss://<хост из лога>" > packages/client/.env.production
 npm run build -w @oasis/client
 ```
 
 Сервер обязан слушать `0.0.0.0` (по умолчанию так, `HOST=0.0.0.0`).
-`.deploy-state` — runtime-состояние (адреса меняются при каждом запуске),
-в git не входит.
+`.deploy-state` — runtime-состояние, в git не входит; на serveo адрес там
+постоянный, на cloudflare/pinggy меняется при каждом запуске.
 
 ## Ограничения
 
-- URL меняются при каждом перезапуске туннеля — клиент надо пересобирать.
+- На serveo URL **постоянный** (имя за ключом), на cloudflare и pinggy
+  меняется при каждом перезапуске туннеля — тогда клиент надо пересобирать.
+- Имя serveo надо выбрать свободное: занятое serveo отклоняет, и деплой
+  честно падает с `remote port forwarding failed`.
 - Туннель живёт, пока жив процесс и ноут; это не постоянный хостинг.
-- Quick tunnel без SLA. Для фазы 2 — VPS + named tunnel или свой сервер.
+- Quick tunnel и free-тарифы без SLA. Для фазы 2 — VPS + named tunnel или
+  свой сервер.
 - Проверка снаружи: `curl https://<client>/` → 200, WS-хэндшейк на сервер →
   `101`; окончательно — `node scripts/deploy-check.mjs` (см. выше).

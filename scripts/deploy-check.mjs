@@ -90,13 +90,14 @@ async function open(label) {
 
   await page.goto(URL, { waitUntil: 'load', timeout: 60_000 });
 
-  // Бесплатные туннели (pinggy) вставляют страницу «Enter site»: одна кнопка
+  // Бесплатные туннели вставляют страницу предупреждения: одна кнопка
   // ставит кукой согласие, после которой проходят и статика, и WebSocket.
   // Без этого клика игра открылась бы, но не подключилась бы — ровно такая
-  // ошибка и была у людей на старом деплое.
+  // ошибка и была у людей на старом деплое. Тексты кнопок у бэкендов разные:
+  // pinggy — «Enter site», serveo — «Continue to Site».
   const clicked = await page.evaluate(() => {
     const button = [...document.querySelectorAll('button, a')].find((element) =>
-      /access\(\)|Enter site/i.test(element.outerHTML),
+      /access\(\)|Enter site|Continue to Site/i.test(element.outerHTML),
     );
     if (!button) return false;
     button.click();
