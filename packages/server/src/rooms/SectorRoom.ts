@@ -14,8 +14,10 @@
 
 import { randomUUID } from 'node:crypto';
 
-import type { Client } from '@colyseus/core';
+import type { AuthContext, Client } from '@colyseus/core';
 import { Room } from '@colyseus/core';
+
+import { readSessionFromCookieHeader } from '../auth/session.ts';
 
 import {
   AOI_RADIUS,
@@ -201,6 +203,40 @@ export class SectorRoom extends Room {
   private bytesOutWindow: number[] = [];
   private lastByteWindowAt = Date.now();
   private readonly maxTickDurations = 2000;
+
+  /**
+   * Auth-lite: берём accountId из подписанной cookie, игнорируем то, что
+   * прислано в теле hello. F0-6 закрывает D-009.
+   *
+   * Где живёт cookie в проде: браузер шлёт её с HTTP-запросом матчмейкина
+   * и апгрейда вебсокета, но для JS она закрыта (HttpOnly), поэтому в
+   * `options` её нет по определению. Colyseus отдаёт эти заголовки третьим
+   * аргументом — `AuthContext.headers`. Без чтения оттуда подписанная кука
+   * в проде не читается вовсе и защита существовала бы только на бумаге.
+   *
+   * В тестах и локальной разработке без cookie разрешаем проход (fallback),
+   * чтобы не ломать существующие тесты и прямые подключения SDK.
+   */
+  override async onAuth(_client: Client, options: any, context?: AuthContext): Promise<any> {
+    const cookieHeader =
+      options?.cookie ??
+      options?.headers?.cookie ??
+      options?.headers?.Cookie ??
+      (options as any)?.['httpHeaders']?.cookie ??
+      (options as any)?.rawHeaders?.cookie ??
+      cookieFromContext(context);
+    const session = readSessionFromCookieHeader(cookieHeader);
+    if (session) return { accountId: session.accountId, issuedAt: session.issuedAt };
+    // В prod без валидной cookie — отказ: accountId от клиента не верим (D-009).
+    if (process.env.NODE_ENV === 'production') return false;
+    // Fallback для dev/tests: используем accountId из options, если передан
+    const accountId = options?.accountId;
+    const issuedAt = options?.accountCreatedAt ?? options?.issuedAt;
+    if (typeof accountId === 'string' && accountId.length >= 8) {
+      return { accountId, issuedAt: typeof issuedAt === 'number' ? issuedAt : Date.now() };
+    }
+    return { accountId: `acct_dev_${Date.now().toString(36)}`, issuedAt: Date.now() };
+  }
 
   override onCreate(options: SectorRoomOptions): void {
     liveRooms.add(this);
@@ -426,6 +462,13 @@ export class SectorRoom extends Room {
     // присылают одинаковый ник — сервер разводит их суффиксом. Суффикс
     // считается до спавна: точка спавна зависит от итогового имени.
     const name = this.uniqueName(sanitizeName(hello.name));
+    // F0-6/F0-7: accountId и accountCreatedAt берём из серверной сессии,
+    // игнорируем client-supplied. D-009 закрыт.
+    const auth = (client.auth ?? {}) as { accountId?: string; issuedAt?: number };
+    const hasServerAuth = typeof auth.accountId === 'string';
+    const accountId: string = (hasServerAuth ? auth.accountId : hello.accountId) ?? `acct_fallback_${client.sessionId}`;
+    const accountCreatedAt: number =
+      hasServerAuth && typeof auth.issuedAt === 'number' ? auth.issuedAt : hello.accountCreatedAt;
 
     // Детерминированный спавн: одинаковое имя — одинаковая точка. Иначе
     // тесты и зонды зависят от порядка подключения, а игроки в центре
@@ -443,7 +486,7 @@ export class SectorRoom extends Room {
       sessionId,
       entityId,
       name,
-      accountId: hello.accountId,
+      accountId,
       color,
       x: spawn.x,
       y: spawn.y,
@@ -486,7 +529,8 @@ export class SectorRoom extends Room {
     });
 
     // Genesis-грант: одноразовый, с пониженной ставкой для свежих аккаунтов.
-    session.balance = await this.grantGenesis(hello.accountId, hello.accountCreatedAt);
+    // F0-6/F0-7: accountCreatedAt берём из подписанной сессии.
+    session.balance = await this.grantGenesis(accountId, accountCreatedAt);
 
     const welcome: WelcomeMsg = {
       protocolVersion: PROTOCOL_VERSION,
@@ -1123,6 +1167,17 @@ function sameState(a: EntityState, b: EntityState): boolean {
     a.flags === b.flags &&
     a.color === b.color
   );
+}
+
+/**
+ * Cookie из контекста colyseus. `AuthContext.headers` — это HTTP-заголовки
+ * запроса матчмейкина/апгрейда: именно туда браузер кладёт HttpOnly-cookie,
+ * недоступную JS, а значит и `options` от клиента.
+ */
+function cookieFromContext(context?: AuthContext): string | undefined {
+  const headers = context?.headers;
+  if (!headers || typeof headers.get !== 'function') return undefined;
+  return headers.get('cookie') ?? undefined;
 }
 
 /** Имя — текст, который увидят другие. Убираем управляющие символы и мусор. */

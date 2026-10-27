@@ -109,6 +109,23 @@ function loadAccount(): Account {
   return account;
 }
 
+/** Получить подписанную сессию с сервера (auth-lite). */
+async function fetchServerSession(): Promise<Account | null> {
+  try {
+    const res = await fetch(`${SERVER_URL.replace(/^ws/, 'http')}/auth/session`, {
+      method: 'GET',
+      credentials: 'include',
+      cache: 'no-store',
+    });
+    if (!res.ok) return null;
+    const data = (await res.json()) as { accountId?: string; issuedAt?: number };
+    if (typeof data.accountId !== 'string' || typeof data.issuedAt !== 'number') return null;
+    return { id: data.accountId, createdAt: data.issuedAt };
+  } catch {
+    return null;
+  }
+}
+
 function loadName(): string {
   const stored = window.localStorage.getItem(NAME_KEY);
   if (stored) return stored;
@@ -448,7 +465,17 @@ async function main(): Promise<void> {
 
   // ── онбординг (F1-8) → подключение ─────────────────────────────────────
 
-  const account = loadAccount();
+  let account = loadAccount();
+  // Auth-lite: приоритет у серверной подписанной сессии.
+  const serverAccount = await fetchServerSession();
+  if (serverAccount) {
+    account = serverAccount;
+    try {
+      window.localStorage.setItem(ACCOUNT_KEY, JSON.stringify(account));
+    } catch {
+      // ignore
+    }
+  }
   const gate = await runOnboarding(loadName());
   if (gate.shown) saveName(gate.name);
   const joinName = gate.name;
