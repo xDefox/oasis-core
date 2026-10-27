@@ -19,6 +19,7 @@ import {
   PLAYER_JUMP_SPEED,
   PLAYER_SPEED,
   PLAYER_SPRINT_SPEED,
+  PLAYER_STEP_UP,
 } from './constants.ts';
 
 export interface Velocity {
@@ -87,8 +88,19 @@ export function speedOf(vx: number, vz: number): number {
 }
 
 /**
- * Вертикаль: прыжок с земли + гравитация.
- * Присед блокирует прыжок. Пол — плоскость GROUND_Y (платформ пока нет).
+ * Вертикаль: прыжок с опоры + гравитация + шаг вверх.
+ *
+ * Присед блокирует прыжок. `groundY` — высота опоры под ногами из
+ * `supportHeightAt` (по умолчанию плоский пол GROUND_Y; платформ пока нет
+ * в спавне, но механика уже считает по ним).
+ *
+ * Шаг вверх (F1-19): если опора чуть выше тела — бордюр, ступенька, низкий
+ * проп — тело подтягивается к ней без прыжка, но не выше `stepUp`: иначе
+ * игрок «въезжал» бы на столб одним касанием. Контракт `supportHeightAt`
+ * гарантирует `groundY <= y + stepUp`, поэтому выше шага тело никогда не
+ * телепортируется.
+ *
+ * @param dt — шаг симуляции в секундах (1 / TICK_RATE).
  */
 export function stepVertical(
   y: number,
@@ -96,10 +108,19 @@ export function stepVertical(
   wantJump: boolean,
   crouch: boolean,
   dt: number,
+  groundY = GROUND_Y,
+  stepUp = PLAYER_STEP_UP,
 ): VerticalState {
   let nextY = y;
   let nextVy = vy;
-  let grounded = nextY <= GROUND_Y + 1e-4 && nextVy <= 1e-4;
+
+  // Шаг вверх: не падение и не прыжок, просто встали на ступеньку.
+  if (groundY > nextY && groundY - nextY <= stepUp) {
+    nextY = groundY;
+    nextVy = 0;
+  }
+
+  let grounded = nextY <= groundY + 1e-4 && nextVy <= 1e-4;
   let jumped = false;
 
   if (grounded && wantJump && !crouch) {
@@ -111,8 +132,11 @@ export function stepVertical(
   nextVy -= PLAYER_GRAVITY * dt;
   nextY += nextVy * dt;
 
-  if (nextY <= GROUND_Y) {
-    nextY = GROUND_Y;
+  // Приземление на опору. Опора обязана быть в пределах шага вверх от
+  // старта тика — иначе это не пол, а препятствие выше головы, и тело
+  // телепортом вверх не тащим.
+  if (nextY <= groundY && groundY - y <= stepUp) {
+    nextY = groundY;
     nextVy = 0;
     grounded = true;
   } else {
