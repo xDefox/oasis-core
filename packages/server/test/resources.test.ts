@@ -74,10 +74,19 @@ describe('добыча: разбор команды чата', () => {
     assert.deepEqual(parseCommand('/  pay   Иван 10 '), { name: 'pay', args: ['Иван', '10'] });
   });
 
+  it('добыча: мост ! работает так же, как слэш', () => {
+    // Клиент перехватывает `/`, но пропускает `!` в чат — сервер обязан
+    // принять оба префикса, иначе команды в живой игре не будет.
+    assert.deepEqual(parseCommand('!gather'), { name: 'gather', args: [] });
+    assert.deepEqual(parseCommand('!pay Иван 10'), { name: 'pay', args: ['Иван', '10'] });
+    assert.deepEqual(parseCommand('!HELP'), { name: 'help', args: [] });
+  });
+
   it('добыча: обычный текст и один слэш — не команда', () => {
     assert.equal(parseCommand('привет, оазис'), null);
     assert.equal(parseCommand('/'), null);
-    assert.equal(parseCommand(' / '), null);
+    assert.equal(parseCommand('!'), null);
+    assert.equal(parseCommand(' ! '), null);
   });
 });
 

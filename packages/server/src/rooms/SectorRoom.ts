@@ -5,7 +5,7 @@
  *  - принимать игроков, выдавать им сущность и стартовый снимок;
  *  - интегрировать движение по фиксированному шагу (сервер — источник истины);
  *  - рассылать каждому игроку только то, что попадает в его область интереса;
- *  - принимать и валидировать ввод, чат, запросы зон, команды `/gather`;
+ *  - принимать и валидировать ввод, чат, запросы зон, команды `/gather`, `/pay`;
  *  - выдавать genesis-грант и начислять добычу через ledger.
  *
  * Чего здесь НЕТ намеренно: PvP, физики, инвентаря, ИИ-агентов.
@@ -34,6 +34,7 @@ import {
   GENESIS_FRESH_ACCOUNT_FACTOR,
   GENESIS_GRANT,
   GROUND_Y,
+  PAY_COOLDOWN_MS,
   PLAYER_CROUCH_HEIGHT,
   PLAYER_HEIGHT,
   PLAYER_RADIUS,
@@ -70,6 +71,7 @@ import {
 } from '@oasis/protocol/validation';
 
 import { parseCommand, type ParsedCommand } from '../chat/commands.ts';
+import { parsePayAmount, payFeeOf, payTotalOf } from '../chat/pay.ts';
 
 import { logInfo, logWarn } from '../config.ts';
 import type { Ledger } from '../store/ledger.ts';
@@ -120,6 +122,8 @@ interface Session {
   lastInputAt: number;
   lastZoneRequestAt: number;
   lastChatErrorAt: number;
+  /** Когда был последний перевод — кулдаун PAY_COOLDOWN_MS. */
+  lastPayAt: number;
   /** Токен, по которому игрок возвращается на это место. */
   resumeToken: string;
   /** Когда пропала связь; null — игрок на связи. */
@@ -523,6 +527,7 @@ export class SectorRoom extends Room {
       teleportUntil: 0,
       lastInputAt: 0,
       lastZoneRequestAt: 0,
+      lastPayAt: 0,
       lastChatErrorAt: 0,
       resumeToken: randomUUID(),
       disconnectedAt: null,
@@ -1166,8 +1171,11 @@ export class SectorRoom extends Room {
       case 'gather':
         void this.commandGather(client, session);
         break;
+      case 'pay':
+        void this.commandPay(client, session, command.args);
+        break;
       default:
-        this.replyTo(client, `Неизвестная команда: /${command.name}. Пока есть /gather.`);
+        this.replyTo(client, `Неизвестная команда: /${command.name}. Есть /gather и /pay.`);
     }
   }
 
@@ -1215,6 +1223,87 @@ export class SectorRoom extends Room {
       client,
       `+${GATHER_REWARD} ¤ за сбор (${permit.usedToday}/${GATHER_DAILY_CAP} сегодня).`,
     );
+  }
+
+  // ────────────────────────────────── команды чата (F1-22: перевод) ────────
+
+  private async commandPay(client: Client, session: Session, args: string[]): Promise<void> {
+    const amount = parsePayAmount(args[1]);
+    if (!args[0] || amount === null) {
+      this.replyTo(client, 'Формат: /pay ник сумма. Например: /pay Иван 10');
+      return;
+    }
+
+    const now = Date.now();
+
+    const target = [...this.sessions.values()].find((candidate) => candidate.name === args[0]);
+    if (!target) {
+      this.replyTo(client, `Игрока «${args[0]}» нет в этом секторе.`);
+      return;
+    }
+    if (target.accountId === session.accountId) {
+      this.replyTo(client, 'Переводить самому себе нельзя.');
+      return;
+    }
+
+    const fee = payFeeOf(amount);
+    const total = payTotalOf(amount);
+    if (session.balance < total) {
+      this.replyTo(client, `Не хватает: нужно ${total} ¤, у тебя ${session.balance} ¤.`);
+      return;
+    }
+
+    // Кулдаун — последний: он защищает от спама, а не объясняет игроку,
+    // что не так с его командой. Отказы выше кулдаун не ставят.
+    if (now - session.lastPayAt < PAY_COOLDOWN_MS) {
+      this.replyTo(client, `Переводы не чаще раза в ${PAY_COOLDOWN_MS / 1000} с.`);
+      return;
+    }
+
+    // Кулдаун ставим до проводок: иначе два одинаковых запроса подряд
+    // оба пройдут проверку и оба запишутся в ledger.
+    session.lastPayAt = now;
+
+    // Три проводки вместо одной: сумма уходит отправителю и приходит
+    // получателю, комиссия сгорает отдельной строкой. Сумма проводок
+    // отправителя = −(сумма + комиссия), а сток видно в истории как
+    // отдельный отрицательный `fee` — docs/05 требует видеть сжигание.
+    await this.ledger.append({
+      worldId: this.world.id,
+      accountId: session.accountId,
+      kind: 'transfer',
+      amount: -amount,
+      reason: 'pay:out',
+      counterpartyId: target.accountId,
+      meta: { fee },
+    });
+    await this.ledger.append({
+      worldId: this.world.id,
+      accountId: target.accountId,
+      kind: 'transfer',
+      amount,
+      reason: 'pay:in',
+      counterpartyId: session.accountId,
+    });
+    if (fee > 0) {
+      await this.ledger.append({
+        worldId: this.world.id,
+        accountId: session.accountId,
+        kind: 'fee',
+        amount: -fee,
+        reason: 'pay:fee',
+        counterpartyId: target.accountId,
+      });
+    }
+
+    session.balance = await this.ledger.balanceOf(session.accountId);
+    target.balance = await this.ledger.balanceOf(target.accountId);
+    client.send(S2C.Balance, { balance: session.balance, reason: 'pay' });
+    target.client.send(S2C.Balance, { balance: target.balance, reason: 'pay' });
+
+    const feeText = fee > 0 ? ` (комиссия ${fee} ¤ сгорела)` : '';
+    this.replyTo(client, `→ ${target.name}: ${amount} ¤${feeText}.`);
+    this.replyTo(target.client, `← ${session.name} перевёл(а) ${amount} ¤${feeText}.`);
   }
 
   // ───────────────────────────────────────────────────────────── чат ───────

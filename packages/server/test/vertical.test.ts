@@ -188,6 +188,12 @@ async function walkTo(
 describe('вертикальный срез: два игрока видят друг друга, двигаются, общаются', () => {
   let gameServer: Server;
   let world: Awaited<ReturnType<typeof loadWorld>>;
+  /**
+   * Общий ledger всех тестовых комнат. Вынесен наружу `before`: тест перевода
+   * досыпает игроку деньги напрямую — комиссия проверяется на сумме свыше
+   * 1000 ¤, а genesis-грант её не покрывает.
+   */
+  let ledger: MemoryLedger;
   /** Мир для теста порталов: спавн стоит прямо в портале, зоны — те же. */
   let portalWorld: Awaited<ReturnType<typeof loadWorld>>;
   /** Мир для теста видимости: спавн вне портала, но зоны граничат близко. */
@@ -251,7 +257,7 @@ describe('вертикальный срез: два игрока видят др
       rot: 0,
     });
 
-    const ledger = new MemoryLedger();
+    ledger = new MemoryLedger();
     const httpServer = http.createServer();
     gameServer = new Server({
       transport: new WebSocketTransport({ server: httpServer }),
@@ -550,7 +556,7 @@ describe('вертикальный срез: два игрока видят др
     await walkTo(room, record, welcome.playerId, node.x, node.z);
 
     const startBalance = await waitFor(() => record.balance, 8000, 'баланс после гранта');
-    room.send('chat', { text: '/gather' });
+    room.send('chat', { text: '!gather' });
     await waitFor(
       () => (record.balance ?? 0) >= startBalance + GATHER_REWARD,
       8000,
@@ -566,14 +572,14 @@ describe('вертикальный срез: два игрока видят др
     assert.equal(echo.name, 'система');
     assert.equal(echo.from, 0);
     assert.ok(
-      !record.chats.some((message) => message.text === '/gather'),
+      !record.chats.some((message) => message.text === '!gather'),
       'команда не должна попадать в общий чат',
     );
 
     // Повторный сбор с той же точки — кулдаун узла, а не лимит чата.
     await delay(450);
     const gathered = record.balance;
-    room.send('chat', { text: '/gather' });
+    room.send('chat', { text: '!gather' });
     await waitFor(
       () => record.chats.some((message) => message.text.includes('переваривается')),
       8000,
@@ -592,7 +598,7 @@ describe('вертикальный срез: два игрока видят др
     });
     const secondWelcome = await waitFor(() => secondRecord.welcome, 8000, 'welcome второго');
     await walkTo(secondRoom, secondRecord, secondWelcome.playerId, node.x, node.z);
-    secondRoom.send('chat', { text: '/gather' });
+    secondRoom.send('chat', { text: '!gather' });
     await waitFor(
       () => secondRecord.chats.some((message) => message.text.includes('переваривается')),
       8000,
@@ -604,6 +610,109 @@ describe('вертикальный срез: два игрока видят др
     );
 
     await secondRoom.leave();
+  });
+
+  it('F1-22: /pay переводит, сжигает комиссию и держит границы', async () => {
+    // Плательщику досыпаем на счёт: комиссия проверяется на сумме свыше
+    // 1000 ¤, а genesis-грант её не покрывает.
+    await ledger.append({
+      worldId: world.id,
+      accountId: 'acct_pay_payer_0001',
+      kind: 'adjustment',
+      amount: 2_000,
+      reason: 'test:seed',
+    });
+
+    const payer = new Client(`ws://localhost:${PORT}`);
+    const { room: payerRoom, record: payerRecord } = await joinWorld(payer, {
+      accountId: 'acct_pay_payer_0001',
+      accountCreatedAt: Date.now() - 5 * 24 * 60 * 60 * 1000,
+      name: 'payer',
+    });
+    const payee = new Client(`ws://localhost:${PORT}`);
+    const { room: payeeRoom, record: payeeRecord } = await joinWorld(payee, {
+      accountId: 'acct_pay_payee_00001',
+      accountCreatedAt: Date.now(),
+      name: 'payee',
+    });
+    await waitFor(() => payerRecord.balance, 8000, 'баланс плательщика');
+    await waitFor(() => payeeRecord.balance, 8000, 'баланс получателя');
+
+    // Лимит чата (400 мс между репликами) молча отбрасывает команды,
+    // поэтому отправляем их через `command`, а не подряд.
+    const command = async (text: string): Promise<void> => {
+      await delay(450);
+      payerRoom.send('chat', { text });
+    };
+
+    // 1. Обычный перевод: 2100 − 10 = 2090 у плательщика, 20 + 10 = 30 у получателя.
+    await command('/pay payee 10');
+    await waitFor(() => payerRecord.balance === 2_090, 8000, 'списание у плательщика');
+    await waitFor(() => payeeRecord.balance === 30, 8000, 'зачисление у получателя');
+    await waitFor(
+      () => payeeRecord.chats.some((message) => message.text.includes('перевёл(а) 10 ¤')),
+      8000,
+      'уведомление получателю',
+    );
+
+    // 2. Кулдаун: повтор сразу же — отказ, балансы не двигаются.
+    await command('/pay payee 10');
+    await waitFor(
+      () => payerRecord.chats.some((message) => message.text.includes('не чаще раза')),
+      8000,
+      'ответ про кулдаун перевода',
+    );
+    assert.equal(payerRecord.balance, 2_090, 'в кулдауне списания нет');
+    assert.equal(payeeRecord.balance, 30, 'в кулдауне зачисления нет');
+
+    // 3–6. Границы: нет такого игрока, перевод себе, кривая сумма, не хватает.
+    // Кулдаун не мешает: отказ не ставит его, стоит только на успехе.
+    await command('/pay stranger 5');
+    await waitFor(
+      () => payerRecord.chats.some((message) => message.text.includes('нет в этом секторе')),
+      8000,
+      'ответ про несуществующего игрока',
+    );
+    await command('/pay payer 5');
+    await waitFor(
+      () => payerRecord.chats.some((message) => message.text.includes('самому себе')),
+      8000,
+      'ответ про перевод себе',
+    );
+    await command('/pay payee 10.5');
+    await waitFor(
+      () => payerRecord.chats.some((message) => message.text.includes('Формат')),
+      8000,
+      'ответ про кривую сумму',
+    );
+    await command('/pay payee 5000');
+    await waitFor(
+      () => payerRecord.chats.some((message) => message.text.includes('Не хватает')),
+      8000,
+      'ответ про нехватку денег',
+    );
+    assert.equal(payerRecord.balance, 2_090, 'после отказов баланс не изменился');
+
+    // 7. Перевод через лимит (1001 > 1000): комиссия 50 ¤ сгорает,
+    //    получатель — ровно сумму.
+    await delay(3_100);
+    payerRoom.send('chat', { text: '/pay payee 1001' });
+    await waitFor(() => payerRecord.balance === 1_039, 8000, 'списание с комиссией');
+    await waitFor(() => payeeRecord.balance === 1_031, 8000, 'зачисление полной суммы');
+    assert.equal(
+      await ledger.hasEntry('acct_pay_payer_0001', 'fee'),
+      true,
+      'комиссия обязана остаться отдельной проводкой в ledger',
+    );
+    const feeEcho = await waitFor(
+      () => payerRecord.chats.find((message) => message.text.includes('комиссия 50 ¤')),
+      8000,
+      'эхо о комиссии',
+    );
+    assert.equal(feeEcho.name, 'система');
+
+    await payerRoom.leave();
+    await payeeRoom.leave();
   });
 
   it('телепортирует через портал и не отправляет обратно (регрессия пинг-понга)', async () => {
