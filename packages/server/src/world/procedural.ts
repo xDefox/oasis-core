@@ -7,7 +7,7 @@
  * что все видят одно и то же.
  */
 
-import { blocksBody, propCollider } from '@oasis/protocol';
+import { PLAYER_STEP_UP, blocksBody, propCollider } from '@oasis/protocol';
 
 import { repairGaps } from './repairGaps.ts';
 import type { Clearing } from './worldCheck.ts';
@@ -58,6 +58,10 @@ export interface GenZoneOptions {
   d: number;
   /** Количество объектов. */
   count: number;
+  /** Сколько узлов добычи («слизней») поставить в зоне, см. F1-21. */
+  resources: number;
+  /** Точка спавна сектора — для учебного узла рядом с ней. */
+  spawn?: { x: number; z: number };
   /** Радиус центральной площадки, где объекты не ставятся (точка спавна). */
   clearRadius: number;
   /**
@@ -75,6 +79,19 @@ const PALETTE: Record<string, number[]> = {
   hub: [0x5c7a9c, 0x44607a, 0x7a9cc4, 0x9c8a7a],
   test: [0x888888, 0x999999, 0x777777, 0xaaaaaa],
 };
+
+/**
+ * Радиус слизня, м. Ровно половина шага вверх: верх шара (2 × радиус) не
+ * выше `PLAYER_STEP_UP`, поэтому тело он не блокирует. Это не косметика:
+ * неблокирующий проп не участвует ни в правилах зазора, ни в запретных
+ * кругах (`worldCheck`, `repairGaps` его не видят) — добыча добавляется в
+ * мир как данные, а не как новое правило коллизий.
+ */
+const RESOURCE_RADIUS = PLAYER_STEP_UP / 2;
+/** Цвет слизней: ярко-зелёный, читается на любом грунте. */
+const RESOURCE_COLOR = 0x8be04b;
+/** Учебный узел стоит в этом отступе от точки спавна по +x. */
+const RESOURCE_TUTORIAL_OFFSET = 2.2;
 
 /**
  * Генерация содержимого зоны. Схема простая, но осмысленная:
@@ -224,6 +241,54 @@ export function generateZoneProps(options: GenZoneOptions): GeneratedProp[] {
         color: palette[Math.floor(random() * palette.length)]!,
       });
     }
+  }
+
+  /**
+   * Слизни — узлы добычи (F1-21). Ставятся последними и отдельно от «обычных»
+   * пропов: узел не блокирует тело, поэтому не участвует ни в раздвигании
+   * щелей, ни в запретных кругах — только обязан остаться в границах зоны.
+   */
+  let resourceIndex = 0;
+  const pushResource = (x: number, z: number): void => {
+    if (Math.abs(x - options.cx) > halfW - 1 || Math.abs(z - options.cz) > halfD - 1) return;
+    units.push([
+      {
+        id: `${options.zoneId}:res${resourceIndex}`,
+        type: 'sphere',
+        x,
+        y: RESOURCE_RADIUS,
+        z,
+        sx: RESOURCE_RADIUS,
+        sy: RESOURCE_RADIUS,
+        sz: RESOURCE_RADIUS,
+        rot: 0,
+        color: RESOURCE_COLOR,
+      },
+    ]);
+    resourceIndex += 1;
+  };
+
+  // Учебный узел рядом со спавном: игрок встречает добычу, не доходя до леса.
+  // Спавн ставим только в той зоне, где он и находится — у z_grove он секторный
+  // и лежит за пределами зоны.
+  const spawnInside =
+    options.spawn !== undefined &&
+    Math.abs(options.spawn.x - options.cx) < halfW - 1 &&
+    Math.abs(options.spawn.z - options.cz) < halfD - 1;
+  if (spawnInside && options.spawn) {
+    pushResource(options.spawn.x + RESOURCE_TUTORIAL_OFFSET, options.spawn.z);
+  }
+  // Хвост узлов — случайные точки зоны. Попытки ограничены, чтобы отклонённая
+  // позиция (за границей) не крутила цикл вечно.
+  for (
+    let attempt = 0;
+    resourceIndex < options.resources && attempt < options.resources * 4;
+    attempt += 1
+  ) {
+    pushResource(
+      options.cx + (random() * 2 - 1) * halfW * 0.85,
+      options.cz + (random() * 2 - 1) * halfD * 0.85,
+    );
   }
 
   // Правила коллизий: щели, в которые игрок влезает и застревает, раздвигаем

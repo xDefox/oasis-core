@@ -16,6 +16,9 @@ import { zoneClearings } from './worldCheck.ts';
 /** Сид мира: один и тот же сид даёт один и тот же мир. */
 export const SEED = 20261021;
 
+/** Спавн сектора вынесен из центра: в центре стоит монумент (см. c5b8ffe). */
+const SECTOR_SPAWN = { x: -5, y: 0, z: 10 };
+
 interface ZoneBlueprint {
   id: string;
   sectorId: string;
@@ -26,6 +29,8 @@ interface ZoneBlueprint {
   w: number;
   d: number;
   count: number;
+  /** Узлов добычи: у леса больше, у площади — учебный рядом со спавном. */
+  resources: number;
   clearRadius: number;
   groundColor: number;
 }
@@ -41,6 +46,7 @@ const ZONE_BLUEPRINTS: ZoneBlueprint[] = [
     w: 64,
     d: 64,
     count: 90,
+    resources: 3,
     clearRadius: 7,
     groundColor: 0x6f7a8c,
   },
@@ -54,6 +60,7 @@ const ZONE_BLUEPRINTS: ZoneBlueprint[] = [
     w: 72,
     d: 72,
     count: 110,
+    resources: 6,
     clearRadius: 6,
     groundColor: 0x3f6b46,
   },
@@ -67,6 +74,7 @@ const ZONE_BLUEPRINTS: ZoneBlueprint[] = [
     w: 56,
     d: 56,
     count: 70,
+    resources: 0,
     clearRadius: 8,
     groundColor: 0x5c4a52,
   },
@@ -88,7 +96,7 @@ export function buildWorld(): WorldDef {
         // Спавн вынесен из центра: в центре стоит монумент (см. c5b8ffe).
         // Генератор обязан воспроизводить закоммиченный world.json байт в байт,
         // иначе правка руками — это долги, которые спишет следующая регенерация.
-        spawn: { x: -5, y: 0, z: 10 },
+        spawn: SECTOR_SPAWN,
       },
     ],
     zones: [],
@@ -118,6 +126,8 @@ export function buildWorld(): WorldDef {
       w: blueprint.w,
       d: blueprint.d,
       count: blueprint.count,
+      resources: blueprint.resources,
+      spawn: SECTOR_SPAWN,
       clearRadius: blueprint.clearRadius,
       clearings: zoneClearings(shell, zone),
       kind: blueprint.kind,
