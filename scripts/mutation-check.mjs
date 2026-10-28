@@ -332,6 +332,84 @@ const MUTATIONS = [
     to: '',
     expect: 'F1-21: /gather',
   },
+  {
+    name: 'команды: мост ! отключён',
+    file: 'packages/server/src/chat/commands.ts',
+    from: "  if (!text.startsWith('/') && !text.startsWith('!')) return null;",
+    to: "  if (!text.startsWith('/')) return null;",
+    expect: 'добыча: мост !',
+  },
+  {
+    name: 'перевод: комиссия не считается',
+    file: 'packages/server/src/chat/pay.ts',
+    from: '  return amount > PAY_FEE_FREE_LIMIT ? Math.round(amount * PAY_FEE_RATE) : 0;',
+    to: '  return 0;',
+    expect: 'перевод: комиссия',
+  },
+  {
+    name: 'перевод: сумма не проверяется',
+    file: 'packages/server/src/chat/pay.ts',
+    from: '  if (raw === undefined || !/^\\d{1,9}$/.test(raw)) return null;',
+    to: '  if (false) return null;',
+    expect: 'перевод: сумма',
+  },
+  {
+    name: 'перевод: можно уйти в минус',
+    file: 'packages/server/src/rooms/SectorRoom.ts',
+    from: `    if (session.balance < total) {
+      this.replyTo(client, \`Не хватает: нужно \${total} ¤, у тебя \${session.balance} ¤.\`);
+      return;
+    }`,
+    to: '',
+    expect: 'F1-22: /pay',
+  },
+  {
+    name: 'перевод: разрешён самому себе',
+    file: 'packages/server/src/rooms/SectorRoom.ts',
+    from: `    if (target.accountId === session.accountId) {
+      this.replyTo(client, 'Переводить самому себе нельзя.');
+      return;
+    }`,
+    to: '',
+    expect: 'F1-22: /pay',
+  },
+  {
+    name: 'перевод: получатель не получает сумму',
+    file: 'packages/server/src/rooms/SectorRoom.ts',
+    from: `      kind: 'transfer',
+      amount,
+      reason: 'pay:in',`,
+    to: `      kind: 'transfer',
+      amount: 0,
+      reason: 'pay:in',`,
+    expect: 'F1-22: /pay',
+  },
+  {
+    name: 'перевод: кулдаун отключён',
+    file: 'packages/server/src/rooms/SectorRoom.ts',
+    from: `    if (now - session.lastPayAt < PAY_COOLDOWN_MS) {
+      this.replyTo(client, \`Переводы не чаще раза в \${PAY_COOLDOWN_MS / 1000} с.\`);
+      return;
+    }`,
+    to: '',
+    expect: 'F1-22: /pay',
+  },
+  {
+    name: 'перевод: комиссия не сгорает в ledger',
+    file: 'packages/server/src/rooms/SectorRoom.ts',
+    from: `    if (fee > 0) {
+      await this.ledger.append({
+        worldId: this.world.id,
+        accountId: session.accountId,
+        kind: 'fee',
+        amount: -fee,
+        reason: 'pay:fee',
+        counterpartyId: target.accountId,
+      });
+    }`,
+    to: '',
+    expect: 'F1-22: /pay',
+  },
 ];
 
 async function runTests() {
