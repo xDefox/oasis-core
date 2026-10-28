@@ -18,6 +18,8 @@ import { Client } from '@colyseus/sdk';
 import {
   AOI_RADIUS,
   BIN_CHANNEL,
+  GATHER_RADIUS,
+  GATHER_REWARD,
   PROTOCOL_VERSION,
   decodeDelta,
   decodeSnapshot,
@@ -33,6 +35,7 @@ import { config } from '../src/config.ts';
 import { SectorRoom } from '../src/rooms/SectorRoom.ts';
 import { MemoryLedger } from '../src/store/ledger.ts';
 import { loadWorld } from '../src/world/loadWorld.ts';
+import { findResourceNear } from '../src/world/resources.ts';
 
 const PORT = 2620;
 
@@ -133,6 +136,53 @@ function ownPosition(
   for (const snapshot of record.snapshots) apply(snapshot.entities);
   for (const delta of record.deltas) apply(delta.changed);
   return position;
+}
+
+/**
+ * Идёт к точке, пока не окажется вплотную.
+ *
+ * Дистанция меряется по дельтам (10 Гц), поэтому останавливаемся с запасом:
+ * последний метр игрок проходит по инерции, и точка зрения теста отстаёт.
+ */
+async function walkTo(
+  room: { sendBytes: (type: string, data: Uint8Array) => unknown },
+  record: Recorder,
+  playerId: number,
+  targetX: number,
+  targetZ: number,
+): Promise<void> {
+  const started = Date.now();
+  let seq = 200;
+  let position = ownPosition(record, playerId);
+  while (Date.now() - started < 6000) {
+    position = ownPosition(record, playerId) ?? position;
+    if (position) {
+      const dx = targetX - position.x;
+      const dz = targetZ - position.z;
+      const distance = Math.hypot(dx, dz);
+      if (distance <= 1) break;
+      room.sendBytes(
+        BIN_CHANNEL,
+        encodeInput({
+          seq: seq++,
+          dirX: dx / distance,
+          dirZ: dz / distance,
+          yaw: 0,
+          sprint: distance > 4,
+        }),
+      );
+    }
+    await delay(40);
+  }
+  room.sendBytes(BIN_CHANNEL, encodeInput({ seq: seq++, dirX: 0, dirZ: 0, yaw: 0, sprint: false }));
+  // Дать дельтам догнать: позиция видна по снимкам 10 Гц, а не по каждому тику.
+  await delay(150);
+  const settled = ownPosition(record, playerId);
+  assert.ok(settled, 'после ходьбы должна прийти дельта с позицией');
+  assert.ok(
+    Math.hypot(targetX - settled.x, targetZ - settled.z) <= GATHER_RADIUS,
+    `игрок должен оказаться в радиусе добычи от (${targetX}, ${targetZ})`,
+  );
 }
 
 describe('вертикальный срез: два игрока видят друг друга, двигаются, общаются', () => {
@@ -479,6 +529,81 @@ describe('вертикальный срез: два игрока видят др
 
     await alphaRoom.leave();
     await betaRoom.leave();
+  });
+
+  it('F1-21: /gather собирает ближайшего слизня, кулдаун делится на всех', async () => {
+    // Учебный слизень стоит в 2.2 м от точки спавна сектора — добыча требует
+    // близости, поэтому тест подходит пешком, как игрок.
+    const gatherZone = world.zones.find((zone) => zone.id === 'z_plaza');
+    assert.ok(gatherZone, 'в мире должна быть плаза');
+
+    const first = new Client(`ws://localhost:${PORT}`);
+    const { room, record } = await joinWorld(first, {
+      accountId: 'acct_gather_00000001',
+      accountCreatedAt: Date.now() - 5 * 24 * 60 * 60 * 1000,
+      name: 'gatherer',
+    });
+    const welcome = await waitFor(() => record.welcome, 8000, 'welcome');
+    const node = findResourceNear(gatherZone, welcome.spawn.x, welcome.spawn.z, 12);
+    assert.ok(node, 'учебный узел добычи должен быть рядом со спавном');
+
+    await walkTo(room, record, welcome.playerId, node.x, node.z);
+
+    const startBalance = await waitFor(() => record.balance, 8000, 'баланс после гранта');
+    room.send('chat', { text: '/gather' });
+    await waitFor(
+      () => (record.balance ?? 0) >= startBalance + GATHER_REWARD,
+      8000,
+      'начисление за сбор',
+    );
+
+    // Ответ команды — реплика «системы» отправителю, а не общий чат.
+    const echo = await waitFor(
+      () => record.chats.find((message) => message.text.includes(`+${GATHER_REWARD} ¤`)),
+      8000,
+      'эхо сбора',
+    );
+    assert.equal(echo.name, 'система');
+    assert.equal(echo.from, 0);
+    assert.ok(
+      !record.chats.some((message) => message.text === '/gather'),
+      'команда не должна попадать в общий чат',
+    );
+
+    // Повторный сбор с той же точки — кулдаун узла, а не лимит чата.
+    await delay(450);
+    const gathered = record.balance;
+    room.send('chat', { text: '/gather' });
+    await waitFor(
+      () => record.chats.some((message) => message.text.includes('переваривается')),
+      8000,
+      'ответ про кулдаун',
+    );
+    await delay(300);
+    assert.equal(record.balance, gathered, 'в кулдауне начисления нет');
+    await room.leave();
+
+    // Кулдаун — свойство узла, а не игрока: второй игрок его тоже ждёт.
+    const second = new Client(`ws://localhost:${PORT}`);
+    const { room: secondRoom, record: secondRecord } = await joinWorld(second, {
+      accountId: 'acct_gather_00000002',
+      accountCreatedAt: Date.now() - 5 * 24 * 60 * 60 * 1000,
+      name: 'gatherer-2',
+    });
+    const secondWelcome = await waitFor(() => secondRecord.welcome, 8000, 'welcome второго');
+    await walkTo(secondRoom, secondRecord, secondWelcome.playerId, node.x, node.z);
+    secondRoom.send('chat', { text: '/gather' });
+    await waitFor(
+      () => secondRecord.chats.some((message) => message.text.includes('переваривается')),
+      8000,
+      'кулдаун узла для второго игрока',
+    );
+    assert.ok(
+      !secondRecord.chats.some((message) => message.text.includes(`+${GATHER_REWARD} ¤`)),
+      'второй игрок не должен получить награду за занятый узел',
+    );
+
+    await secondRoom.leave();
   });
 
   it('телепортирует через портал и не отправляет обратно (регрессия пинг-понга)', async () => {

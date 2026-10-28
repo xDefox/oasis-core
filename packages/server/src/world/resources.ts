@@ -7,7 +7,12 @@
  * добавляется в мир как данные, а не как новое правило коллизий.
  */
 
-import { GATHER_RADIUS, RESOURCE_PROP_PREFIX } from '@oasis/protocol';
+import {
+  GATHER_DAILY_CAP,
+  GATHER_NODE_COOLDOWN_MS,
+  GATHER_RADIUS,
+  RESOURCE_PROP_PREFIX,
+} from '@oasis/protocol';
 import type { PropDef, ZoneDef } from '@oasis/protocol';
 
 /**
@@ -33,4 +38,41 @@ export function findResourceNear(
     }
   }
   return best;
+}
+
+/** Успешный сбор: номер под лимитом — чтобы показать прогресс в сутках. */
+export type GatherPermit =
+  | { ok: true; usedToday: number }
+  | { ok: false; reason: 'cooldown'; retryMs: number }
+  | { ok: false; reason: 'cap' };
+
+/** Сутки капа — по UTC, как и все timestamps в ledger. */
+export function dayKey(now: number): string {
+  return new Date(now).toISOString().slice(0, 10);
+}
+
+/**
+ * Кулдауны узлов и суточный кап по аккаунтам.
+ *
+ * `consume` атомарно и то, и другое: раз проверка прошла — узел занят и
+ * счётчик увеличен. Если начисление упадёт (ledger недоступен), сбор всё
+ * равно сгорит: иначе зациклится «фарм → ошибка → фарм».
+ */
+export class GatherTracker {
+  private readonly readyAt = new Map<string, number>();
+  private readonly byAccount = new Map<string, { day: string; count: number }>();
+
+  consume(nodeId: string, accountId: string, now: number): GatherPermit {
+    const readyAt = this.readyAt.get(nodeId) ?? 0;
+    if (now < readyAt) return { ok: false, reason: 'cooldown', retryMs: readyAt - now };
+
+    const day = dayKey(now);
+    const state = this.byAccount.get(accountId);
+    const usedToday = state && state.day === day ? state.count : 0;
+    if (usedToday >= GATHER_DAILY_CAP) return { ok: false, reason: 'cap' };
+
+    this.readyAt.set(nodeId, now + GATHER_NODE_COOLDOWN_MS);
+    this.byAccount.set(accountId, { day, count: usedToday + 1 });
+    return { ok: true, usedToday: usedToday + 1 };
+  }
 }

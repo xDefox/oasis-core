@@ -301,6 +301,37 @@ const MUTATIONS = [
     to: '    if (true) {',
     expect: 'добыча: вне радиуса',
   },
+  {
+    name: 'добыча: кулдаун узла отключён',
+    file: 'packages/server/src/world/resources.ts',
+    from: "    if (now < readyAt) return { ok: false, reason: 'cooldown', retryMs: readyAt - now };",
+    to: '',
+    expect: 'добыча: собранный узел',
+  },
+  {
+    name: 'добыча: суточный кап отключён',
+    file: 'packages/server/src/world/resources.ts',
+    from: "    if (usedToday >= GATHER_DAILY_CAP) return { ok: false, reason: 'cap' };",
+    to: '',
+    expect: 'добыча: суточный кап',
+  },
+  {
+    name: 'добыча: награда не начисляется',
+    file: 'packages/server/src/rooms/SectorRoom.ts',
+    from: '      amount: GATHER_REWARD,',
+    to: '      amount: 0,',
+    expect: 'F1-21: /gather',
+  },
+  {
+    name: 'добыча: команды чата не обрабатываются',
+    file: 'packages/server/src/rooms/SectorRoom.ts',
+    from: `      if (command) {
+        this.runCommand(client, session, command);
+        return;
+      }`,
+    to: '',
+    expect: 'F1-21: /gather',
+  },
 ];
 
 async function runTests() {
