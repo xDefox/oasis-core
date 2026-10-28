@@ -5,8 +5,8 @@
  *  - принимать игроков, выдавать им сущность и стартовый снимок;
  *  - интегрировать движение по фиксированному шагу (сервер — источник истины);
  *  - рассылать каждому игроку только то, что попадает в его область интереса;
- *  - принимать и валидировать ввод, чат, запросы зон;
- *  - выдавать genesis-грант через ledger.
+ *  - принимать и валидировать ввод, чат, запросы зон, команды `/gather`;
+ *  - выдавать genesis-грант и начислять добычу через ledger.
  *
  * Чего здесь НЕТ намеренно: PvP, физики, инвентаря, ИИ-агентов.
  * Протокол и сектор разделены: всё, что не касается симуляции, живёт в ядре.
@@ -27,6 +27,9 @@ import {
   CHAT_MESSAGES_PER_SECOND,
   ENTITY_FLAG,
   EntityKind,
+  GATHER_DAILY_CAP,
+  GATHER_RADIUS,
+  GATHER_REWARD,
   GENESIS_ACCOUNT_MIN_AGE_MS,
   GENESIS_FRESH_ACCOUNT_FACTOR,
   GENESIS_GRANT,
@@ -66,9 +69,12 @@ import {
   zoneRequestSchema,
 } from '@oasis/protocol/validation';
 
+import { parseCommand, type ParsedCommand } from '../chat/commands.ts';
+
 import { logInfo, logWarn } from '../config.ts';
 import type { Ledger } from '../store/ledger.ts';
 import { findZone, zoneAt } from '../world/loadWorld.ts';
+import { findResourceNear, GatherTracker } from '../world/resources.ts';
 import { spawnPoint } from '../world/spawnPoint.ts';
 
 interface SessionInput {
@@ -189,6 +195,8 @@ export class SectorRoom extends Room {
    * обычное дело, и без этой карты обе успевают увидеть «проводки нет».
    */
   private readonly genesisInFlight = new Map<string, Promise<number>>();
+  /** Кулдауны слизней и суточный кап добычи — по F1-21. */
+  private readonly gather = new GatherTracker();
   private readonly entities = new Map<number, EntityState>();
   /** Коллайдеры пропов по зонам — собираются один раз при создании комнаты. */
   private readonly zoneColliders = new Map<string, ZoneColliders>();
@@ -315,6 +323,14 @@ export class SectorRoom extends Room {
 
       const text = message.text.trim().slice(0, 240);
       if (!text) return;
+
+      // Команда — это действие, а не реплика: в общий чат она не попадает.
+      const command = parseCommand(text);
+      if (command) {
+        this.runCommand(client, session, command);
+        return;
+      }
+
       this.broadcast(S2C.Chat, {
         from: session.entityId,
         name: session.name,
@@ -1141,6 +1157,64 @@ export class SectorRoom extends Room {
       meta: { accountAgeMs: age },
     });
     return this.ledger.balanceOf(accountId);
+  }
+
+  // ────────────────────────────────── команды чата (F1-21: добыча) ────────
+
+  private runCommand(client: Client, session: Session, command: ParsedCommand): void {
+    switch (command.name) {
+      case 'gather':
+        void this.commandGather(client, session);
+        break;
+      default:
+        this.replyTo(client, `Неизвестная команда: /${command.name}. Пока есть /gather.`);
+    }
+  }
+
+  /** Ответ отправителю: результат команды — не реплика в общий чат. */
+  private replyTo(client: Client, text: string): void {
+    client.send(S2C.Chat, { from: 0, name: 'система', text, ts: Date.now() });
+  }
+
+  private async commandGather(client: Client, session: Session): Promise<void> {
+    const zone = session.zoneId ? findZone(this.world, session.zoneId) : null;
+    if (!zone) {
+      this.replyTo(client, 'Сначала окажись в зоне.');
+      return;
+    }
+
+    const node = findResourceNear(zone, session.x, session.z, GATHER_RADIUS);
+    if (!node) {
+      this.replyTo(client, `Рядом нет слизня: подойди ближе чем на ${GATHER_RADIUS} м.`);
+      return;
+    }
+
+    const permit = this.gather.consume(node.id, session.accountId, Date.now());
+    if (!permit.ok) {
+      this.replyTo(
+        client,
+        permit.reason === 'cooldown'
+          ? `Слизнь переваривается ещё ${Math.ceil(permit.retryMs / 1000)} с.`
+          : `Суточная норма ${GATHER_DAILY_CAP} сборов исчерпана.`,
+      );
+      return;
+    }
+
+    // Начисление через ledger: баланс — сумма проводок, историю можно проверить.
+    await this.ledger.append({
+      worldId: this.world.id,
+      accountId: session.accountId,
+      kind: 'source',
+      amount: GATHER_REWARD,
+      reason: 'gather',
+      meta: { node: node.id },
+    });
+    session.balance = await this.ledger.balanceOf(session.accountId);
+    client.send(S2C.Balance, { balance: session.balance, reason: 'gather' });
+    this.replyTo(
+      client,
+      `+${GATHER_REWARD} ¤ за сбор (${permit.usedToday}/${GATHER_DAILY_CAP} сегодня).`,
+    );
   }
 
   // ───────────────────────────────────────────────────────────── чат ───────
