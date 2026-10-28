@@ -287,6 +287,20 @@ const MUTATIONS = [
     to: '',
     expect: 'повторно не перевыпускается',
   },
+  {
+    name: 'добыча: узел без фильтра по префиксу',
+    file: 'packages/server/src/world/resources.ts',
+    from: '    if (!prop.id.includes(RESOURCE_PROP_PREFIX)) continue;',
+    to: '    if (false) continue;',
+    expect: 'добыча: обычный проп не считается узлом',
+  },
+  {
+    name: 'добыча: радиус не проверяется',
+    file: 'packages/server/src/world/resources.ts',
+    from: '    if (distance <= bestDistance) {',
+    to: '    if (true) {',
+    expect: 'добыча: вне радиуса',
+  },
 ];
 
 async function runTests() {

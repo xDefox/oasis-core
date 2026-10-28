@@ -64,6 +64,25 @@ export const GENESIS_ACCOUNT_MIN_AGE_MS = 24 * 60 * 60 * 1000;
 export const GENESIS_FRESH_ACCOUNT_FACTOR = 0.2;
 export const FAUCET_DAILY_CAP = 50;
 
+/**
+ * Добыча (F1-21). Кран «добыча» — один из пяти из docs/05: кап в сутки на
+ * игрока, никакого бесконечного фарма. Цифры согласованы в плейтесте 28.10.
+ */
+/**
+ * Узел добычи опознаётся по префиксу `:res` в id — например `z_grove:res0`.
+ * Двоеточие обязательно: id пропа устроен как `зона:тип+номер`, и без
+ * разделителя «res» ловилось бы и «restroom», и любое совпадение в середине.
+ */
+export const RESOURCE_PROP_PREFIX = ':res';
+/** Радиус, в котором /gather находит узел, м. */
+export const GATHER_RADIUS = 3;
+/** Сколько ¤ за один сбор. */
+export const GATHER_REWARD = 3;
+/** Кулдаун узла: слизнь «восстанавливается» после сбора. */
+export const GATHER_NODE_COOLDOWN_MS = 20_000;
+/** Суточный кап сборов на аккаунт: 20 × 3 ¤ = 60 ¤ в сутки. */
+export const GATHER_DAILY_CAP = 20;
+
 /** Идентификаторы бинарных сообщений (первый байт пакета). */
 export const BIN = {
   Snapshot: 1,
